@@ -14,6 +14,7 @@ API-derived.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import traceback
@@ -22,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 from functools import wraps
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ContextTypes
 from ulid import ULID
@@ -33,55 +34,19 @@ from analysis import (
     parse_groq_recommendation,
     run_analysis,
 )
+from pnl import build_snapshot, format_snapshot_markdown, render_snapshot_image
 from propr import ProprAPIError, ProprClient, max_leverage_for, normalize_asset
+from utils import escape_md, fmt_num
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_MAX_LEN = 4000  # safe under Telegram's 4096 hard cap
-MARKDOWN_V2_ESCAPE = r"_*[]()~`>#+-=|{}.!\\"
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers
+# Formatting helpers — ``escape_md`` and ``fmt_num`` live in :mod:`utils` now
+# so :mod:`pnl` and :mod:`ws_listener` can share them without import cycles.
 # ---------------------------------------------------------------------------
-def escape_md(text: Any) -> str:
-    """Escape MarkdownV2 special characters in *text*.
-
-    Pass any user-supplied or API-derived value through this before embedding
-    it into a reply that uses ``ParseMode.MARKDOWN_V2``.
-    """
-    s = "" if text is None else str(text)
-    out = []
-    for ch in s:
-        if ch in MARKDOWN_V2_ESCAPE:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def fmt_num(value: Any, places: int = 2) -> str:
-    """Format *value* as a decimal with up to *places* digits after the point.
-
-    Trailing zeros are stripped. Non-numeric input is returned as-is.
-    """
-    if value is None or value == "":
-        return "-"
-    try:
-        d = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return str(value)
-    quantizer = Decimal("1").scaleb(-places) if places > 0 else Decimal("1")
-    try:
-        d = d.quantize(quantizer)
-    except InvalidOperation:
-        pass
-    text = format(d, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
-
-
 def _split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> List[str]:
     """Split *text* into chunks ≤ *limit* on line boundaries."""
     if len(text) <= limit:
@@ -1057,6 +1022,68 @@ def _half_qty(qty: Decimal) -> Decimal:
     return half.quantize(Decimal("0.00000001"))
 
 
+# ---------------------------------------------------------------------------
+# PnL commands
+# ---------------------------------------------------------------------------
+@authorized
+async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/pnl`` — text snapshot of realized + unrealized PnL.
+
+    ``/pnl image`` returns the same data as a PNG card rendered via Pillow.
+    """
+    try:
+        client = _get_client(context)
+        account_id = await _ensure_account_id(context)
+        raw_positions = await client.get_positions(account_id)
+        snapshot = build_snapshot(raw_positions)
+
+        args = [a.lower() for a in (context.args or [])]
+        if "image" in args:
+            chat_id = update.effective_chat.id
+            png_bytes = await asyncio.to_thread(render_snapshot_image, snapshot)
+            total = snapshot.total
+            sign = "+" if total >= 0 else ""
+            caption = f"✅ Total PnL: {sign}{fmt_num(total)} USDC"
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(io.BytesIO(png_bytes), filename="pnl.png"),
+                caption=caption,
+            )
+            return
+
+        await _reply(update, format_snapshot_markdown(snapshot, escape_md))
+    except Exception as exc:  # noqa: BLE001
+        await _report_error(update, exc)
+
+
+@authorized
+async def cmd_livepnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/livepnl`` — toggle live PnL push notifications on position updates.
+
+    ``/livepnl`` alone reports the current state; ``/livepnl on|off``
+    enables/disables the websocket-driven live pushes.
+    """
+    try:
+        bot_data = context.application.bot_data
+        args = [a.lower() for a in (context.args or [])]
+
+        if args:
+            choice = args[0]
+            if choice in ("on", "enable", "enabled", "true", "1"):
+                bot_data["live_pnl_enabled"] = True
+            elif choice in ("off", "disable", "disabled", "false", "0"):
+                bot_data["live_pnl_enabled"] = False
+            else:
+                await _reply(update, "Usage: `/livepnl [on|off]`")
+                return
+
+        enabled = bool(bot_data.get("live_pnl_enabled"))
+        label = "🔴 Live PnL: ON" if enabled else "⚪ Live PnL: OFF"
+        await _reply(update, escape_md(label))
+    except Exception as exc:  # noqa: BLE001
+        await _report_error(update, exc)
+
+
 @authorized
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/help`` — list every command with a short example."""
@@ -1076,6 +1103,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/tp <asset> <trigger>` — take\\-profit on long\n"
         "• `/leverage <asset> <n>` — set leverage\n"
         "• `/analysis <asset> [tf] [dir]` — AI trade plan\n"
+        "• `/pnl [image]` — show realized \\+ unrealized PnL \\(append `image` for PNG card\\)\n"
+        "• `/livepnl [on|off]` — toggle real\\-time PnL updates\n"
         "• `/help` — this message"
     )
     await _reply(update, text)
@@ -1118,5 +1147,7 @@ COMMAND_HANDLERS: List[Tuple[str, HandlerFn]] = [
     ("tp", tp_cmd),
     ("leverage", leverage_cmd),
     ("analysis", analysis_cmd),
+    ("pnl", cmd_pnl),
+    ("livepnl", cmd_livepnl),
     ("help", help_cmd),
 ]
