@@ -120,10 +120,11 @@ def _make_post_init(api_key: str, chat_id: int):
 
         app.bot_data["propr"] = client
         app.bot_data["account_id"] = account_id
+        app.bot_data["live_pnl_enabled"] = False
 
         loop = asyncio.get_event_loop()
         ws_task = loop.create_task(
-            run_ws_listener(app.bot, chat_id, api_key, account_id),
+            run_ws_listener(app, chat_id, api_key, account_id),
             name="propr-ws-listener",
         )
         sweeper_task = loop.create_task(
