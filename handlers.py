@@ -561,7 +561,11 @@ async def cancelall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @authorized
 async def sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/sl <asset> <triggerPrice>`` — stop-loss on the current long."""
+    """``/sl <asset> <triggerPrice>`` — stop-loss on the current position.
+
+    Picks whichever side (long or short) is currently open on *asset* —
+    previously rejected shorts outright (PR #1 review finding #9).
+    """
     try:
         args = parse_args(context, 2, 2)
         if args is None:
@@ -574,21 +578,22 @@ async def sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         account_id = await _ensure_account_id(context)
         positions = await client.get_positions(account_id)
         target = next(
-            (
-                p
-                for p in positions
-                if _pos_asset_upper(p) == asset and _pos_side(p) == "long"
-            ),
+            (p for p in positions if _pos_asset_upper(p) == asset),
             None,
         )
         if target is None:
-            await _reply(update, f"⚠️ No open long position on `{escape_md(asset)}`")
+            await _reply(update, f"⚠️ No open position on `{escape_md(asset)}`")
+            return
+        side = _pos_side(target)
+        if side not in ("long", "short"):
+            await _reply(update, "⚠️ Could not determine position side\\.")
             return
         qty = target.get("quantity", target.get("qty"))
-        await client.stop_loss(account_id, asset, qty, trigger, "long")
+        await client.stop_loss(account_id, asset, qty, trigger, side)
         await _reply(
             update,
-            f"🛡 Stop\\-loss set on {escape_md(asset)} at *{escape_md(fmt_num(trigger))}*",
+            f"🛡 Stop\\-loss set on {escape_md(side.upper())} {escape_md(asset)} "
+            f"at *{escape_md(fmt_num(trigger))}*",
         )
     except ValueError as exc:
         await _reply(update, f"⚠️ {escape_md(exc)}")
@@ -598,7 +603,11 @@ async def sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def tp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/tp <asset> <triggerPrice>`` — take-profit on the current long."""
+    """``/tp <asset> <triggerPrice>`` — take-profit on the current position.
+
+    Picks whichever side (long or short) is currently open on *asset* —
+    previously rejected shorts outright (PR #1 review finding #9).
+    """
     try:
         args = parse_args(context, 2, 2)
         if args is None:
@@ -611,21 +620,22 @@ async def tp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         account_id = await _ensure_account_id(context)
         positions = await client.get_positions(account_id)
         target = next(
-            (
-                p
-                for p in positions
-                if _pos_asset_upper(p) == asset and _pos_side(p) == "long"
-            ),
+            (p for p in positions if _pos_asset_upper(p) == asset),
             None,
         )
         if target is None:
-            await _reply(update, f"⚠️ No open long position on `{escape_md(asset)}`")
+            await _reply(update, f"⚠️ No open position on `{escape_md(asset)}`")
+            return
+        side = _pos_side(target)
+        if side not in ("long", "short"):
+            await _reply(update, "⚠️ Could not determine position side\\.")
             return
         qty = target.get("quantity", target.get("qty"))
-        await client.take_profit(account_id, asset, qty, trigger, "long")
+        await client.take_profit(account_id, asset, qty, trigger, side)
         await _reply(
             update,
-            f"🎯 Take\\-profit set on {escape_md(asset)} at *{escape_md(fmt_num(trigger))}*",
+            f"🎯 Take\\-profit set on {escape_md(side.upper())} {escape_md(asset)} "
+            f"at *{escape_md(fmt_num(trigger))}*",
         )
     except ValueError as exc:
         await _reply(update, f"⚠️ {escape_md(exc)}")
@@ -680,6 +690,16 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         timeframe = args[1].lower() if len(args) >= 2 else "1h"
         direction = args[2].lower() if len(args) >= 3 else None
 
+        # PR #1 review finding #10 — gate on a whitelist so we don't kick off a
+        # Groq call with a bogus interval that Binance will reject.
+        from analysis import VALID_INTERVALS
+        if timeframe not in VALID_INTERVALS:
+            await _reply(
+                update,
+                "⚠️ Unsupported timeframe\\. Use: 15m, 1h, 4h, 1d",
+            )
+            return
+
         chat_id = update.effective_chat.id
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -719,6 +739,10 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         full_text = raw + footer
         chunks = _split_message(full_text, TELEGRAM_MAX_LEN)
 
+        # PR #1 review finding #14 — only show the Execute/Skip keyboard and
+        # store a PENDING_TRADES entry when the parse yielded an auto-executable
+        # trade. Non-executable analyses go out as text only.
+        executable = bool(parsed.get("executable"))
         keyboard = InlineKeyboardMarkup(
             [[
                 InlineKeyboardButton(
@@ -728,7 +752,7 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "❌ Skip", callback_data=f"skip_trade:{pending_id}"
                 ),
             ]]
-        )
+        ) if executable else None
 
         last_message_id: Optional[int] = None
         for idx, chunk in enumerate(chunks):
@@ -738,22 +762,22 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 chat_id=chat_id,
                 text=escaped,
                 parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard if is_last and parsed.get("executable") else None,
+                reply_markup=keyboard if is_last else None,
             )
             last_message_id = sent.message_id
 
-        PENDING_TRADES[pending_id] = PendingTrade(
-            pending_id=pending_id,
-            chat_id=chat_id,
-            asset=asset,
-            timeframe=timeframe,
-            raw_analysis=raw,
-            parsed=parsed,
-            created_at=datetime.now(timezone.utc),
-            message_id=last_message_id,
-        )
-
-        if not parsed.get("executable"):
+        if executable:
+            PENDING_TRADES[pending_id] = PendingTrade(
+                pending_id=pending_id,
+                chat_id=chat_id,
+                asset=asset,
+                timeframe=timeframe,
+                raw_analysis=raw,
+                parsed=parsed,
+                created_at=datetime.now(timezone.utc),
+                message_id=last_message_id,
+            )
+        else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -934,7 +958,10 @@ async def _execute_parsed_trade(
         )
         return
 
-    # Step 3: stop loss
+    # Step 3: stop loss — critical. If placement fails after a live entry,
+    # the position is naked so we attempt an immediate close (PR #1 review
+    # finding #3). A failed close means the user has an unprotected position
+    # and we surface a loud warning.
     try:
         await client.place_order(
             account_id=account_id,
@@ -947,18 +974,32 @@ async def _execute_parsed_trade(
             triggerPrice=stop_loss,
             reduceOnly=True,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as sl_exc:  # noqa: BLE001
+        try:
+            await client.close_position(account_id, asset, position_side)
+        except Exception as close_exc:  # noqa: BLE001
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚨 SL placement failed AND close failed. "
+                    f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                    f"Reasons: SL={sl_exc} | close={close_exc}"
+                ),
+            )
+            return
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ Execution failed at step stop_loss: {exc}",
+            text=f"❌ SL placement failed; position closed. Reason: {sl_exc}",
         )
         return
 
-    # Step 4: take profit(s)
-    tp_msgs = []
-    try:
-        if tp2 is not None:
-            half_qty = _half_qty(quantity)
+    # Step 4: take profit(s) — non-fatal. SL is live, so a TP failure just
+    # means the user has to place TPs manually; the position is protected.
+    tp_msgs: List[str] = []
+    tp_warnings: List[str] = []
+    if tp2 is not None:
+        half_qty = _half_qty(quantity)
+        try:
             await client.place_order(
                 account_id=account_id,
                 asset=asset,
@@ -970,6 +1011,10 @@ async def _execute_parsed_trade(
                 triggerPrice=tp1,
                 reduceOnly=True,
             )
+            tp_msgs.append(f"TP1: {fmt_num(tp1)}")
+        except Exception as tp_exc:  # noqa: BLE001
+            tp_warnings.append(f"⚠️ TP1 failed: {tp_exc} — SL is still active")
+        try:
             await client.place_order(
                 account_id=account_id,
                 asset=asset,
@@ -981,11 +1026,11 @@ async def _execute_parsed_trade(
                 triggerPrice=tp2,
                 reduceOnly=True,
             )
-            tp_msgs = [
-                f"TP1: {fmt_num(tp1)}",
-                f"TP2: {fmt_num(tp2)}",
-            ]
-        else:
+            tp_msgs.append(f"TP2: {fmt_num(tp2)}")
+        except Exception as tp_exc:  # noqa: BLE001
+            tp_warnings.append(f"⚠️ TP2 failed: {tp_exc} — SL is still active")
+    else:
+        try:
             await client.place_order(
                 account_id=account_id,
                 asset=asset,
@@ -997,13 +1042,12 @@ async def _execute_parsed_trade(
                 triggerPrice=tp1,
                 reduceOnly=True,
             )
-            tp_msgs = [f"TP1: {fmt_num(tp1)}"]
-    except Exception as exc:  # noqa: BLE001
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Execution failed at step take_profit: {exc}",
-        )
-        return
+            tp_msgs.append(f"TP1: {fmt_num(tp1)}")
+        except Exception as tp_exc:  # noqa: BLE001
+            tp_warnings.append(f"⚠️ TP1 failed: {tp_exc} — SL is still active")
+
+    for warning in tp_warnings:
+        await context.bot.send_message(chat_id=chat_id, text=warning)
 
     direction_upper = direction.upper()
     summary_parts = [
@@ -1029,7 +1073,9 @@ def _half_qty(qty: Decimal) -> Decimal:
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/pnl`` — text snapshot of realized + unrealized PnL.
 
-    ``/pnl image`` returns the same data as a PNG card rendered via Pillow.
+    ``/pnl image`` returns a Propr-style share card PNG rendered via Pillow
+    (focusing on the position with the largest absolute uPnL). Empty
+    positions still produce a neutral "No open positions" card.
     """
     try:
         client = _get_client(context)
@@ -1040,15 +1086,27 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         args = [a.lower() for a in (context.args or [])]
         if "image" in args:
             chat_id = update.effective_chat.id
-            png_bytes = await asyncio.to_thread(render_snapshot_image, snapshot)
             total = snapshot.total
             sign = "+" if total >= 0 else ""
             caption = f"✅ Total PnL: {sign}{fmt_num(total)} USDC"
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=InputFile(io.BytesIO(png_bytes), filename="pnl.png"),
-                caption=caption,
-            )
+            try:
+                png_bytes = await asyncio.to_thread(render_snapshot_image, snapshot)
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(io.BytesIO(png_bytes), filename="pnl.png"),
+                    caption=caption,
+                )
+            except Exception as render_exc:  # noqa: BLE001 — Pillow / font failures
+                log.error(
+                    "render_snapshot_image failed: %s\n%s",
+                    render_exc,
+                    traceback.format_exc(),
+                )
+                await _reply(update, format_snapshot_markdown(snapshot, escape_md))
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Could not render PnL card — showing text instead.",
+                )
             return
 
         await _reply(update, format_snapshot_markdown(snapshot, escape_md))
@@ -1099,8 +1157,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/close <asset>` — close a position\n"
         "• `/cancel <orderId>` — cancel one order\n"
         "• `/cancelall` — cancel every open order\n"
-        "• `/sl <asset> <trigger>` — stop\\-loss on long\n"
-        "• `/tp <asset> <trigger>` — take\\-profit on long\n"
+        "• `/sl <asset> <trigger>` — stop\\-loss on current position \\(long or short\\)\n"
+        "• `/tp <asset> <trigger>` — take\\-profit on current position \\(long or short\\)\n"
         "• `/leverage <asset> <n>` — set leverage\n"
         "• `/analysis <asset> [tf] [dir]` — AI trade plan\n"
         "• `/pnl [image]` — show realized \\+ unrealized PnL \\(append `image` for PNG card\\)\n"

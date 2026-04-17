@@ -23,7 +23,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import websockets
 from telegram.constants import ParseMode
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.exceptions import (
+    ConnectionClosed,
+    InvalidHandshake,
+    InvalidStatusCode,
+    WebSocketException,
+)
 
 from utils import escape_md, fmt_num
 
@@ -340,6 +345,23 @@ async def run_ws_listener(
         except asyncio.CancelledError:
             log.info("ws listener cancelled")
             raise
+        except InvalidStatusCode as exc:
+            # PR #1 review finding #11 — handshake rejections for bad creds
+            # must kill the process instead of retrying forever. Other 4xx/5xx
+            # codes fall through to the generic reconnect branch.
+            status = getattr(exc, "status_code", None)
+            if status in (401, 403):
+                log.critical("ws handshake rejected with %s: %s", status, exc)
+                raise SystemExit(
+                    f"WS auth rejected ({status}). Check PROPR_API_KEY."
+                ) from exc
+            log.warning("ws handshake returned %s; reconnecting in %ss",
+                        status, RECONNECT_DELAY)
+        except InvalidHandshake as exc:
+            # Parent class — most variants don't carry a status_code, so we
+            # just log and retry. PR #1 review finding #11.
+            log.warning("ws handshake failed (%s); reconnecting in %ss",
+                        exc, RECONNECT_DELAY)
         except (ConnectionClosed, WebSocketException, OSError) as exc:
             log.warning("ws disconnected (%s); reconnecting in %ss",
                         exc, RECONNECT_DELAY)

@@ -116,7 +116,15 @@ def _make_post_init(api_key: str, chat_id: int):
 
     async def _post_init(app: Application) -> None:
         client = ProprClient(api_key)
-        account_id = await _startup_checks(client)
+        try:
+            # PR #1 review finding #6 \u2014 if the startup checks throw (network,
+            # auth, missing account), the httpx client inside ProprClient
+            # was previously leaked because we bailed before storing it in
+            # bot_data. Close it explicitly and re-raise.
+            account_id = await _startup_checks(client)
+        except Exception:
+            await client.close()
+            raise
 
         app.bot_data["propr"] = client
         app.bot_data["account_id"] = account_id
