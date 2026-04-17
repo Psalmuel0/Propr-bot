@@ -17,6 +17,9 @@ tap the `✅ Execute Trade` button.
 - `/analysis` command: Groq writes a full market-structure + risk report,
   parses back into structured fields, and offers a one-tap execute button
   that places entry + stop-loss + take-profits in sequence.
+- Natural-language trading: type what you want in plain English; Groq
+  parses the intent, the bot shows a confirmation card with Execute/Cancel
+  buttons, and routes to the right Propr helper.
 - MarkdownV2 replies with safe escaping.
 - Challenge-rule aware: surfaces drawdown and daily-loss headroom in every
   analysis.
@@ -77,10 +80,27 @@ You will see `Bot ready ✅` in the log when it is listening.
 | `/tp <asset> <trigger>`                        | `/tp BTC 98000`                         | Take-profit on the current long                          |
 | `/leverage <asset> <n>`                        | `/leverage BTC 3`                       | Change leverage (BTC/ETH max 5x, others max 2x)          |
 | `/analysis <asset> [timeframe] [direction]`    | `/analysis BTC 1h long`                 | AI analysis with inline execute/skip buttons             |
+| `/trade <prompt>`                              | `/trade close all btc`                  | Run the natural-language parser on `<prompt>`            |
 | `/help`                                        | `/help`                                 | This command list                                        |
 
 `timeframe` accepts `15m`, `1h`, `4h`, `1d` (defaults to `1h`).
 `direction` is an optional user hint — leave it empty to let the AI decide.
+
+## Natural language
+
+You can also just type what you want — no slash command. The bot parses the
+message with Groq, shows a confirmation card, and executes on tap.
+
+Examples:
+
+- `hey open long on btc with $4,000 and 5x leverage`
+- `short eth 0.5 at 3450 with SL 3550 and TP 3300`
+- `close my btc`
+- `set SL on BTC at 91000`
+- `analyze SOL 4h`
+
+Same prompts work with `/trade` prefixed (useful when the first word would
+collide with a reserved command name, e.g. `/trade close all btc`).
 
 ## File structure
 
