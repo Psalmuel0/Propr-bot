@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from utils import escape_md as _default_escape_md
 from utils import fmt_num
@@ -215,32 +216,58 @@ def format_snapshot_markdown(snapshot: PnLSnapshot, escape_md=None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PNG card rendering
+# PNG share-card rendering (Propr-style, 1200x900, one position per card)
 # ---------------------------------------------------------------------------
-_BG = "#0D1117"
-_CARD_BG = "#161B22"
-_GREEN = "#22C55E"
-_RED = "#EF4444"
-_WHITE = "#FFFFFF"
-_GRAY = "#9CA3AF"
-_FOOTER_GRAY = "#6B7280"
-_SEP_LINE = "#30363D"
+_CARD_W, _CARD_H = 1200, 900
 
-_FONT_CANDIDATES_BOLD = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-)
-_FONT_CANDIDATES_REG = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-)
+# Fallback solid background when ``assets/bg.jpg`` is missing at render time.
+_FALLBACK_BG = (13, 17, 23)  # #0D1117
+
+# Tint overlays mixed with the blurred background at alpha 0.45.
+_TINT_PROFIT = (20, 90, 55)
+_TINT_LOSS = (90, 30, 30)
+_TINT_NEUTRAL = (25, 45, 35)
+
+# Text colors.
+_COL_WHITE = (255, 255, 255)
+_COL_DIM = (201, 209, 217)           # #C9D1D9
+_COL_GRAY = (125, 133, 144)          # #7D8590
+_COL_PROFIT = (74, 222, 128)         # #4ADE80
+_COL_LOSS = (248, 113, 113)          # #F87171
+
+# Per-asset brand colors for the icon disc.
+_ASSET_COLORS = {
+    "BTC": "#F7931A",
+    "ETH": "#627EEA",
+    "SOL": "#14F195",
+    "DOGE": "#C2A633",
+    "XRP": "#23292F",
+    "AVAX": "#E84142",
+    "LINK": "#2A5ADA",
+}
+_ASSET_FALLBACK_COLOR = "#6B7280"
+
+# Background asset. Kept relative to this module so the bot works regardless of
+# the caller's CWD. File is committed to the repo \u2014 see task spec.
+_BG_PATH = os.path.join(os.path.dirname(__file__), "assets", "bg.jpg")
+
+_FONT_PATH_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_FONT_PATH_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 _FONT_FALLBACK_WARNED = False
 
 
-def _load_font(candidates: Tuple[str, ...], size: int) -> ImageFont.ImageFont:
-    """Try each *candidates* path in order; warn once and fall back on default."""
+def _font(size: int, bold: bool = True) -> ImageFont.ImageFont:
+    """Return a TrueType font at *size*, falling back to PIL default once.
+
+    Tries DejaVuSans-Bold first (or DejaVuSans when ``bold=False``) then the
+    other, then ``ImageFont.load_default()`` with a one-shot warning so we
+    don't flood logs on every card.
+    """
     global _FONT_FALLBACK_WARNED
+    candidates: Tuple[str, ...] = (
+        (_FONT_PATH_BOLD, _FONT_PATH_REG) if bold else (_FONT_PATH_REG, _FONT_PATH_BOLD)
+    )
     for path in candidates:
         try:
             return ImageFont.truetype(path, size=size)
@@ -254,243 +281,292 @@ def _load_font(candidates: Tuple[str, ...], size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _load_fonts() -> Dict[str, ImageFont.ImageFont]:
-    return {
-        "title": _load_font(_FONT_CANDIDATES_BOLD, 48),
-        "total_num": _load_font(_FONT_CANDIDATES_BOLD, 56),
-        "total_lbl": _load_font(_FONT_CANDIDATES_REG, 18),
-        "timestamp": _load_font(_FONT_CANDIDATES_REG, 18),
-        "asset": _load_font(_FONT_CANDIDATES_BOLD, 28),
-        "pill": _load_font(_FONT_CANDIDATES_BOLD, 16),
-        "middle": _load_font(_FONT_CANDIDATES_REG, 18),
-        "pnl": _load_font(_FONT_CANDIDATES_BOLD, 28),
-        "roe": _load_font(_FONT_CANDIDATES_REG, 16),
-        "empty": _load_font(_FONT_CANDIDATES_BOLD, 36),
-        "more": _load_font(_FONT_CANDIDATES_BOLD, 22),
-        "footer": _load_font(_FONT_CANDIDATES_REG, 14),
-    }
+def _fmt_signed(x: Decimal, places: int = 1) -> str:
+    """Format *x* with a mandatory sign to *places* decimals (``+6.5``, ``-4.2``)."""
+    q = Decimal(10) ** -places if places > 0 else Decimal(1)
+    try:
+        d = x.quantize(q)
+    except InvalidOperation:
+        d = x
+    sign = "-" if d < 0 else "+"
+    abs_text = format(abs(d), "f")
+    if places > 0 and "." not in abs_text:
+        abs_text = f"{abs_text}.{'0' * places}"
+    return sign + abs_text
 
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int, int, int]:
-    """Return (width, height, x_offset, y_offset) for *text* rendered with *font*."""
+def _fmt_price(x: Decimal) -> str:
+    """Format a price with thousands separator and 2 decimal places."""
+    try:
+        d = x.quantize(Decimal("0.01"))
+    except InvalidOperation:
+        d = x
+    # Python's ``,`` format spec on Decimal gives us the grouping.
+    return f"{d:,.2f}"
+
+
+def _text_wh(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont
+) -> Tuple[int, int, int, int]:
+    """Return ``(width, height, x_offset, y_offset)`` from ``textbbox``."""
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1], bbox[0], bbox[1]
 
 
-def _draw_text_centered(
-    draw: ImageDraw.ImageDraw,
-    box: Tuple[int, int, int, int],
-    text: str,
-    font: ImageFont.ImageFont,
-    fill: str,
-) -> None:
-    """Center-draw *text* inside the ``(x0, y0, x1, y1)`` *box*."""
-    x0, y0, x1, y1 = box
-    w, h, ox, oy = _text_size(draw, text, font)
-    x = x0 + ((x1 - x0) - w) / 2 - ox
-    y = y0 + ((y1 - y0) - h) / 2 - oy
-    draw.text((x, y), text, font=font, fill=fill)
+def _asset_icon(asset: str, size: int) -> Image.Image:
+    """Render the round asset icon: colored disc + first-letter glyph."""
+    color = _ASSET_COLORS.get(asset.upper(), _ASSET_FALLBACK_COLOR)
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((0, 0, size - 1, size - 1), fill=color)
 
-
-def _draw_header(
-    draw: ImageDraw.ImageDraw,
-    width: int,
-    snapshot: PnLSnapshot,
-    fonts: Dict[str, ImageFont.ImageFont],
-    padding: int,
-) -> None:
-    """Draw the top-left title/timestamp and top-right combined-total block."""
-    draw.text((padding, padding), "PnL Snapshot", font=fonts["title"], fill=_WHITE)
-
-    ts = snapshot.generated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-    draw.text((padding, padding + 62), ts, font=fonts["timestamp"], fill=_GRAY)
-
-    # Right-aligned TOTAL label + big combined number
-    total_text = f"{_signed(snapshot.total)} USDC"
-    total_color = _GREEN if snapshot.total >= 0 else _RED
-
-    lbl_w, _, lbl_ox, _ = _text_size(draw, "TOTAL", fonts["total_lbl"])
-    num_w, _, num_ox, _ = _text_size(draw, total_text, fonts["total_num"])
-
-    right_x = width - padding
+    letter = (asset[:1] or "?").upper()
+    # ~70% of the disc is a typographically pleasing glyph size.
+    glyph_font = _font(max(12, int(size * 0.7)), bold=True)
+    w, h, ox, oy = _text_wh(draw, letter, glyph_font)
     draw.text(
-        (right_x - lbl_w - lbl_ox, padding + 4),
-        "TOTAL",
-        font=fonts["total_lbl"],
-        fill=_GRAY,
+        ((size - w) / 2 - ox, (size - h) / 2 - oy),
+        letter,
+        font=glyph_font,
+        fill=_COL_WHITE,
     )
-    draw.text(
-        (right_x - num_w - num_ox, padding + 28),
-        total_text,
-        font=fonts["total_num"],
-        fill=total_color,
-    )
+    return img
 
 
-def _draw_position_card(
-    draw: ImageDraw.ImageDraw,
-    y: int,
-    pos: PositionPnL,
-    fonts: Dict[str, ImageFont.ImageFont],
-    padding: int,
-    width: int,
-) -> None:
-    """Draw a single position row as a rounded card at vertical offset *y*."""
-    card_x0 = padding
-    card_x1 = width - padding
-    card_y1 = y + 90
+def _propr_mark(size: int) -> Image.Image:
+    """Render the stylized Propr mark (rounded white square + black X).
+
+    Returns an RGBA image of *size* pixels square ready to be pasted onto
+    the card background.
+    """
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    radius = max(2, size // 6)
     draw.rounded_rectangle(
-        (card_x0, y, card_x1, card_y1),
-        radius=12,
-        fill=_CARD_BG,
+        (0, 0, size - 1, size - 1),
+        radius=radius,
+        fill=(255, 255, 255, 235),
     )
+    pad = size // 6
+    stroke = max(2, size // 18)
+    draw.line((pad, pad, size - pad, size - pad), fill=(0, 0, 0, 255), width=stroke)
+    draw.line((size - pad, pad, pad, size - pad), fill=(0, 0, 0, 255), width=stroke)
+    return img
 
-    # Pill
-    pill_color = _GREEN if pos.side == "long" else _RED
-    pill_text = pos.side.upper() if pos.side in ("long", "short") else "?"
-    pill_x0 = card_x0 + 16
-    pill_y0 = y + 29
-    pill_w, pill_h = 80, 32
-    pill_x1 = pill_x0 + pill_w
-    pill_y1 = pill_y0 + pill_h
-    draw.rounded_rectangle(
-        (pill_x0, pill_y0, pill_x1, pill_y1),
-        radius=pill_h // 2,
-        fill=pill_color,
-    )
-    _draw_text_centered(
-        draw, (pill_x0, pill_y0, pill_x1, pill_y1), pill_text, fonts["pill"], _WHITE
-    )
 
-    # Asset symbol — 28px bold white next to the pill
-    asset_x = pill_x1 + 16
-    asset_w, asset_h, asset_ox, asset_oy = _text_size(draw, pos.asset, fonts["asset"])
-    asset_y = y + (90 - asset_h) / 2 - asset_oy
-    draw.text((asset_x - asset_ox, asset_y), pos.asset, font=fonts["asset"], fill=_WHITE)
+def _apply_bg(path: str, w: int, h: int, is_profit: bool, empty: bool) -> Image.Image:
+    """Build the base card image: blurred background + tint overlay.
 
-    # Middle: qty @ entry → mark
-    qty_s = fmt_num(pos.quantity, 6)
-    entry_s = fmt_num(pos.entry_price)
-    mark_s = fmt_num(pos.mark_price)
-    mid_text = f"{qty_s} @ {entry_s}  →  {mark_s}"
-    mid_x = asset_x + asset_w + 40
-    mid_w, mid_h, mid_ox, mid_oy = _text_size(draw, mid_text, fonts["middle"])
-    mid_y = y + (90 - mid_h) / 2 - mid_oy
-    draw.text((mid_x - mid_ox, mid_y), mid_text, font=fonts["middle"], fill=_GRAY)
+    Falls back to a solid dark color if the JPEG is missing or fails to load.
+    The *empty* flag uses the neutral (cool green) tint so the empty-state
+    card doesn't misrepresent account state.
+    """
+    base: Optional[Image.Image] = None
+    if os.path.isfile(path):
+        try:
+            raw = Image.open(path).convert("RGB")
+            base = raw.resize((w, h), Image.LANCZOS)
+            base = base.filter(ImageFilter.GaussianBlur(radius=18))
+            base = ImageEnhance.Brightness(base).enhance(0.35)
+        except (OSError, IOError, ValueError) as exc:
+            log.warning("assets/bg.jpg load failed (%s); using fallback fill", exc)
+            base = None
+    else:
+        log.warning("assets/bg.jpg missing at %s; using fallback fill", path)
 
-    # Right column: uPnL + ROE%
-    pnl_color = _GREEN if pos.unrealized_pnl >= 0 else _RED
-    pnl_text = f"{_signed(pos.unrealized_pnl)} USDC"
-    roe_text = f"ROE {_signed(pos.roe_pct)}%"
+    if base is None:
+        base = Image.new("RGB", (w, h), _FALLBACK_BG)
 
-    pnl_w, _, pnl_ox, _ = _text_size(draw, pnl_text, fonts["pnl"])
-    roe_w, _, roe_ox, _ = _text_size(draw, roe_text, fonts["roe"])
+    if empty:
+        tint_color = _TINT_NEUTRAL
+    else:
+        tint_color = _TINT_PROFIT if is_profit else _TINT_LOSS
+    tint = Image.new("RGB", (w, h), tint_color)
+    return Image.blend(base, tint, 0.45)
 
-    right_x = card_x1 - 20
+
+def _draw_bottom_gradient(
+    draw: ImageDraw.ImageDraw, w: int, h: int, height: int = 200
+) -> None:
+    """Darken the bottom *height* px progressively toward full black.
+
+    Implemented with a stack of 1px-tall rectangles whose alpha ramps from
+    0 at the top of the band to ~220 at the very bottom, giving the entry /
+    mark row extra legibility without a hard edge.
+    """
+    # The draw target is RGB so we draw with an RGBA source onto an overlay.
+    overlay_img = draw._image  # type: ignore[attr-defined]
+    overlay = Image.new("RGBA", (w, height), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    for i in range(height):
+        # Ease-in: quadratic ramp looks smoother than linear on dark imagery.
+        t = (i / max(1, height - 1)) ** 2
+        alpha = int(220 * t)
+        overlay_draw.line([(0, i), (w, i)], fill=(0, 0, 0, alpha))
+    overlay_img.paste(overlay, (0, h - height), overlay)
+
+
+def _pick_focus(snapshot: PnLSnapshot) -> Optional[PositionPnL]:
+    """Select the position with the largest absolute unrealized PnL."""
+    if not snapshot.positions:
+        return None
+    return max(snapshot.positions, key=lambda p: abs(p.unrealized_pnl))
+
+
+def render_snapshot_image(
+    snap: PnLSnapshot, *, focus: Optional[PositionPnL] = None
+) -> bytes:
+    """Render a single-position share card as PNG bytes.
+
+    If *focus* is provided, render that position. Otherwise pick the position
+    with the largest absolute unrealized PnL. If ``snap.positions`` is empty,
+    render a neutral 'No open positions' card (same layout, dimmed).
+    """
+    w, h = _CARD_W, _CARD_H
+
+    if focus is None:
+        focus = _pick_focus(snap)
+
+    empty = focus is None
+    is_profit = bool(focus and focus.unrealized_pnl >= 0)
+
+    img = _apply_bg(_BG_PATH, w, h, is_profit=is_profit, empty=empty)
+    img = img.convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    _draw_bottom_gradient(draw, w, h, height=200)
+
+    # --- Top-left: asset icon + ticker + side/leverage -------------------
+    if focus is not None:
+        icon_size = 72
+        icon = _asset_icon(focus.asset, icon_size)
+        img.paste(icon, (60, 60 - 20), icon)  # center the icon around y=60..132
+
+        ticker_font = _font(64, bold=True)
+        ticker = focus.asset
+        t_w, t_h, t_ox, t_oy = _text_wh(draw, ticker, ticker_font)
+        ticker_x = 60 + icon_size + 20
+        # Baseline alignment: visual midline of the icon is at ~y=76.
+        ticker_y = 52 - t_oy
+        draw.text((ticker_x - t_ox, ticker_y), ticker, font=ticker_font, fill=_COL_WHITE)
+
+        lev_int = int(focus.leverage) if focus.leverage else 1
+        side_label = (focus.side or "?").capitalize()
+        side_text = f"{side_label} {lev_int}x"
+        side_font = _font(42, bold=True)
+        s_w, s_h, s_ox, s_oy = _text_wh(draw, side_text, side_font)
+        side_x = ticker_x + t_w + 30
+        # Baseline-aligned with the ticker's visual midline.
+        side_y = 52 - s_oy + (t_h - s_h) // 2
+        draw.text((side_x - s_ox, side_y), side_text, font=side_font, fill=_COL_DIM)
+    else:
+        # Dim neutral header when no position \u2014 just a plain PROPR mark kept
+        # intact on the right (below).
+        pass
+
+    # --- Top-right: Propr mark + PROPR wordmark --------------------------
+    propr_size = 72
+    propr = _propr_mark(propr_size)
+    word_font = _font(56, bold=True)
+    word_w, word_h, word_ox, word_oy = _text_wh(draw, "PROPR", word_font)
+
+    gap = 20
+    right_margin = 60
+    total_w = propr_size + gap + word_w
+    propr_x = w - right_margin - total_w
+    propr_y = 60 - 20  # align with top-left icon band
+    img.paste(propr, (propr_x, propr_y), propr)
     draw.text(
-        (right_x - pnl_w - pnl_ox, y + 15),
-        pnl_text,
-        font=fonts["pnl"],
+        (propr_x + propr_size + gap - word_ox, 52 - word_oy),
+        "PROPR",
+        font=word_font,
+        fill=_COL_WHITE,
+    )
+
+    # --- Headline ROI % + secondary PnL line -----------------------------
+    if focus is not None:
+        if focus.margin_used == 0:
+            roi_pct = Decimal(0)
+        else:
+            roi_pct = (focus.unrealized_pnl / focus.margin_used) * Decimal(100)
+        pnl_color = _COL_PROFIT if focus.unrealized_pnl >= 0 else _COL_LOSS
+
+        roi_text = _fmt_signed(roi_pct, 1) + "%"
+        roi_font = _font(220, bold=True)
+        r_w, r_h, r_ox, r_oy = _text_wh(draw, roi_text, roi_font)
+        # y=200 is the top of the block per spec.
+        draw.text(((w - r_w) / 2 - r_ox, 200 - r_oy), roi_text, font=roi_font, fill=pnl_color)
+
+        pnl_text = f"{_fmt_signed(focus.unrealized_pnl, 2)} USDC"
+        pnl_font = _font(64, bold=True)
+        p_w, p_h, p_ox, p_oy = _text_wh(draw, pnl_text, pnl_font)
+        draw.text(((w - p_w) / 2 - p_ox, 450 - p_oy), pnl_text, font=pnl_font, fill=pnl_color)
+    else:
+        empty_text = "No open positions"
+        empty_font = _font(60, bold=False)
+        e_w, e_h, e_ox, e_oy = _text_wh(draw, empty_text, empty_font)
+        draw.text(
+            ((w - e_w) / 2 - e_ox, (h - e_h) / 2 - e_oy),
+            empty_text,
+            font=empty_font,
+            fill=_COL_GRAY,
+        )
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue()
+
+    # --- Bottom-left: Entry Price / Mark Price ---------------------------
+    label_font = _font(30, bold=False)
+    lbl2_font = _font(22, bold=False)
+    value_font = _font(56, bold=True)
+    ref_code_font = _font(52, bold=True)
+
+    draw.text((60, h - 200), "Entry Price", font=label_font, fill=_COL_GRAY)
+    draw.text(
+        (60, h - 155),
+        _fmt_price(focus.entry_price),
+        font=value_font,
+        fill=_COL_WHITE,
+    )
+
+    draw.text((500, h - 200), "Mark Price", font=label_font, fill=_COL_GRAY)
+    draw.text(
+        (500, h - 155),
+        _fmt_price(focus.mark_price),
+        font=value_font,
+        fill=_COL_WHITE,
+    )
+
+    # --- Bottom-right: REFERRAL block ------------------------------------
+    pnl_color = _COL_PROFIT if focus.unrealized_pnl >= 0 else _COL_LOSS
+    ref_code = "HhNG2"  # placeholder per spec; real code plumbed later
+    ref_url = f"app.propr.xyz/r/{ref_code}"
+
+    ref_lbl_w, _, ref_lbl_ox, ref_lbl_oy = _text_wh(draw, "REFERRAL", lbl2_font)
+    code_w, _, code_ox, code_oy = _text_wh(draw, ref_code, ref_code_font)
+    url_w, _, url_ox, url_oy = _text_wh(draw, ref_url, _font(26, bold=False))
+
+    right_x = w - 60
+    draw.text(
+        (right_x - ref_lbl_w - ref_lbl_ox, h - 210 - ref_lbl_oy),
+        "REFERRAL",
+        font=lbl2_font,
+        fill=_COL_GRAY,
+    )
+    draw.text(
+        (right_x - code_w - code_ox, h - 175 - code_oy),
+        ref_code,
+        font=ref_code_font,
+        fill=_COL_WHITE,
+    )
+    draw.text(
+        (right_x - url_w - url_ox, h - 95 - url_oy),
+        ref_url,
+        font=_font(26, bold=False),
         fill=pnl_color,
     )
-    draw.text(
-        (right_x - roe_w - roe_ox, y + 55),
-        roe_text,
-        font=fonts["roe"],
-        fill=_GRAY,
-    )
-
-
-def _draw_positions(
-    draw: ImageDraw.ImageDraw,
-    snapshot: PnLSnapshot,
-    fonts: Dict[str, ImageFont.ImageFont],
-    padding: int,
-    width: int,
-    start_y: int = 150,
-) -> None:
-    """Draw up to 5 position cards, plus a ``+N more`` row if truncated."""
-    visible = snapshot.positions[:5]
-    overflow = len(snapshot.positions) - len(visible)
-    card_stride = 110  # 90px card + 20px gap
-
-    for i, pos in enumerate(visible):
-        _draw_position_card(
-            draw, start_y + i * card_stride, pos, fonts, padding, width
-        )
-
-    if overflow > 0:
-        y = start_y + len(visible) * card_stride
-        label = f"+{overflow} more"
-        lw, lh, lox, loy = _text_size(draw, label, fonts["more"])
-        draw.text(
-            ((width - lw) / 2 - lox, y + (30 - lh) / 2 - loy),
-            label,
-            font=fonts["more"],
-            fill=_GRAY,
-        )
-
-
-def _draw_empty(
-    draw: ImageDraw.ImageDraw,
-    width: int,
-    height: int,
-    fonts: Dict[str, ImageFont.ImageFont],
-) -> None:
-    """Centered 'No open positions' for the empty snapshot case."""
-    _draw_text_centered(
-        draw, (0, 0, width, height), "No open positions", fonts["empty"], _GRAY
-    )
-
-
-def _draw_footer(
-    draw: ImageDraw.ImageDraw,
-    width: int,
-    height: int,
-    fonts: Dict[str, ImageFont.ImageFont],
-    padding: int,
-) -> None:
-    """Thin separator + centered brand footer at the bottom of the canvas."""
-    sep_y = height - 40
-    draw.line(
-        [(padding, sep_y), (width - padding, sep_y)],
-        fill=_SEP_LINE,
-        width=1,
-    )
-    text = "propr.xyz · live PnL"
-    tw, th, tox, toy = _text_size(draw, text, fonts["footer"])
-    draw.text(
-        ((width - tw) / 2 - tox, sep_y + 10),
-        text,
-        font=fonts["footer"],
-        fill=_FOOTER_GRAY,
-    )
-
-
-def render_snapshot_image(snapshot: PnLSnapshot) -> bytes:
-    """Render the PnL card as a 1200x800 PNG and return its raw bytes.
-
-    Pillow calls are blocking, so callers should invoke this via
-    :func:`asyncio.to_thread` from an async context.
-    """
-    width, height = 1200, 800
-    padding = 40
-
-    img = Image.new("RGB", (width, height), _BG)
-    draw = ImageDraw.Draw(img)
-    fonts = _load_fonts()
-
-    _draw_header(draw, width, snapshot, fonts, padding)
-
-    if not snapshot.positions:
-        _draw_empty(draw, width, height, fonts)
-    else:
-        _draw_positions(draw, snapshot, fonts, padding, width)
-
-    _draw_footer(draw, width, height, fonts, padding)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -500,55 +576,64 @@ def render_snapshot_image(snapshot: PnLSnapshot) -> bytes:
 if __name__ == "__main__":
     import sys
 
-    fake_raw = [
+    # Profit variant \u2014 single long BTC position matching the spec's example:
+    # entry 74386.00, mark 75359.50, uPnL +65.44, margin_used 1006.77, lev 5.
+    # ROI should format as +6.5%.
+    fake_profit = [
         {
-            "positionId": "pos-1",
+            "positionId": "pos-btc",
             "asset": "BTC",
             "positionSide": "long",
             "status": "open",
-            "quantity": "0.010",
-            "entryPrice": "94500",
-            "markPrice": "94850",
-            "unrealizedPnl": "3.5",
+            "quantity": "0.068",
+            "entryPrice": "74386.00",
+            "markPrice": "75359.50",
+            "unrealizedPnl": "65.44",
             "realizedPnl": "0",
-            "leverage": "3",
-            "marginUsed": "315",
-            "returnOnEquity": "0.011111",
-            "cumulativeFunding": "0",
-            "cumulativeTradingFees": "0",
-        },
-        {
-            "positionId": "pos-2",
-            "asset": "xyz:ETH",
-            "positionSide": "short",
-            "status": "open",
-            "quantity": "0.5",
-            "entryPrice": "3500",
-            "markPrice": "3565",
-            "unrealizedPnl": "-32.5",
-            "realizedPnl": "-2.1",
-            "leverage": "2",
-            "marginUsed": "875",
-            "returnOnEquity": "-0.03714",
-            "cumulativeFunding": "0",
-            "cumulativeTradingFees": "0.25",
-        },
+            "leverage": "5",
+            "marginUsed": "1006.77",
+            "returnOnEquity": "0.065",
+        }
     ]
 
-    snap = build_snapshot(fake_raw)
-    print(format_snapshot_markdown(snap, _default_escape_md))
-    print()
+    fake_loss = [
+        {
+            "positionId": "pos-eth",
+            "asset": "ETH",
+            "positionSide": "short",
+            "status": "open",
+            "quantity": "0.25",
+            "entryPrice": "3480.50",
+            "markPrice": "3594.80",
+            "unrealizedPnl": "-28.70",
+            "realizedPnl": "0",
+            "leverage": "3",
+            "marginUsed": "668.76",
+            "returnOnEquity": "-0.042",
+        }
+    ]
 
-    png = render_snapshot_image(snap)
-    out = "/tmp/pnl_smoke.png"
-    with open(out, "wb") as fh:
-        fh.write(png)
-    print(f"wrote {out} ({len(png)} bytes)")
+    snap_profit = build_snapshot(fake_profit)
+    snap_loss = build_snapshot(fake_loss)
 
-    if not png.startswith(b"\x89PNG"):
-        print("ERROR: output is not a PNG", file=sys.stderr)
-        sys.exit(1)
-    if len(png) < 1024:
-        print(f"ERROR: PNG too small ({len(png)} bytes)", file=sys.stderr)
-        sys.exit(1)
+    png_profit = render_snapshot_image(snap_profit)
+    png_loss = render_snapshot_image(snap_loss)
+
+    out_profit = "/tmp/pnl_share_profit.png"
+    out_loss = "/tmp/pnl_share_loss.png"
+    with open(out_profit, "wb") as fh:
+        fh.write(png_profit)
+    with open(out_loss, "wb") as fh:
+        fh.write(png_loss)
+
+    print(f"profit: {out_profit} ({len(png_profit)} bytes)")
+    print(f"loss:   {out_loss} ({len(png_loss)} bytes)")
+
+    for label, payload in ((out_profit, png_profit), (out_loss, png_loss)):
+        if not payload.startswith(b"\x89PNG"):
+            print(f"ERROR: {label} is not a PNG", file=sys.stderr)
+            sys.exit(1)
+        if len(payload) <= 5000:
+            print(f"ERROR: {label} too small ({len(payload)} bytes)", file=sys.stderr)
+            sys.exit(1)
     print("OK")
