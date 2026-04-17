@@ -20,7 +20,13 @@ from typing import List
 
 import httpx
 from dotenv import load_dotenv
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 import handlers
 from analysis import sweep_pending_trades
@@ -108,6 +114,12 @@ def _register_handlers(app: Application) -> None:
     for name, func in handlers.COMMAND_HANDLERS:
         app.add_handler(CommandHandler(name, func))
     app.add_handler(CallbackQueryHandler(handlers.callback_query))
+    # Natural-language text handler — placed AFTER every CommandHandler so
+    # commands take precedence. ``~filters.COMMAND`` excludes ``/foo`` slash
+    # messages so a mis-registered command never slips into the NL parser.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text)
+    )
     app.add_error_handler(handlers.error_handler)
 
 

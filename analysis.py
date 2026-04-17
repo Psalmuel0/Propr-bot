@@ -13,6 +13,7 @@ This module is responsible for three things:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -105,6 +106,204 @@ Never deviate from this output format. It will be parsed programmatically."""
 
 
 # ---------------------------------------------------------------------------
+# Intent parser — converts free-form chat into a structured trade intent.
+# ---------------------------------------------------------------------------
+INTENT_SYSTEM_PROMPT = """You are a strict JSON intent parser for a crypto trading bot on Hyperliquid.
+Your ONLY output is a single JSON object. No prose, no code fences, no markdown.
+
+Supported intents:
+  - "open"          open a new position
+  - "close"         fully close an existing position
+  - "sl"            attach stop-loss to an existing position
+  - "tp"            attach take-profit to an existing position
+  - "setleverage"   change leverage on an asset
+  - "analysis"      run AI analysis on an asset
+  - "unknown"       intent unclear
+
+Schema (fields not applicable must be null):
+{
+  "intent": "open|close|sl|tp|setleverage|analysis|unknown",
+  "asset": "BTC | ETH | SOL | ... | null",
+  "side": "long|short|null",
+  "order_type": "market|limit|null",
+  "quantity": "<decimal as string>|null",
+  "usd_amount": "<decimal as string>|null",
+  "leverage": "<integer>|null",
+  "limit_price": "<decimal as string>|null",
+  "stop_loss": "<decimal as string>|null",
+  "take_profit": "<decimal as string>|null",
+  "timeframe": "15m|1h|4h|1d|null",
+  "notes": "<short human-readable paraphrase of the request>"
+}
+
+Rules:
+- For "open": exactly one of quantity or usd_amount must be set.
+- usd_amount is the notional in USDC the user wants to deploy (e.g. "$4000" -> "4000").
+- leverage is an integer; default null if unspecified.
+- order_type is "limit" when a specific price is given (e.g. "buy btc at 92000"), otherwise "market".
+- If the user says "close my btc", intent="close", asset="BTC", side can be null (we'll figure it out).
+- If you can't map the text to a supported intent, return intent="unknown" with a polite `notes` explaining why.
+- Assets: BTC, ETH, SOL, DOGE, XRP, ADA, AVAX, LINK, LTC, MATIC, ARB, OP, SUI, APT, SEI, TIA, INJ, PEPE, WIF, BONK, AAPL, TSLA, NVDA, MSFT, META, GOOGL, AMZN, GOLD, SILVER, OIL.
+- Never invent prices. If user didn't say a price, leave it null.
+- Output MUST be valid JSON parsable by json.loads.
+"""
+
+VALID_INTENT_KINDS = frozenset({
+    "open", "close", "sl", "tp", "setleverage", "analysis", "unknown",
+})
+
+
+def _unknown_intent(reason: str) -> Dict[str, Any]:
+    """Return the canonical ``intent=unknown`` sentinel with a reason in notes."""
+    return {
+        "intent": "unknown",
+        "asset": None,
+        "side": None,
+        "order_type": None,
+        "quantity": None,
+        "usd_amount": None,
+        "leverage": None,
+        "limit_price": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "timeframe": None,
+        "notes": f"Could not parse: {reason}",
+    }
+
+
+_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?|\n?```\s*$", re.IGNORECASE)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove accidental ```json ... ``` fences the model may emit."""
+    if not text:
+        return ""
+    # Greedy trim of leading/trailing fences; inner backticks are left alone.
+    out = text.strip()
+    if out.startswith("```"):
+        out = _CODE_FENCE_RE.sub("", out, count=1)
+    if out.endswith("```"):
+        out = _CODE_FENCE_RE.sub("", out, count=1)
+    return out.strip()
+
+
+def _call_groq_intent_sync(api_key: str, text: str) -> str:
+    """Synchronous Groq call for intent parsing — invoked via ``asyncio.to_thread``."""
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.0,
+        max_tokens=500,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content or ""
+
+
+async def parse_trade_intent(text: str) -> Dict[str, Any]:
+    """Run the user's free-form text through Groq and return the parsed intent.
+
+    Returns the JSON decoded as a dict. On any failure (JSON parse error, Groq
+    error, empty response), returns ``{"intent": "unknown", ...}`` with a
+    ``notes`` field explaining why — the caller never crashes.
+
+    Decimal-valued fields are left as strings in the returned dict; convert
+    at the caller so schema changes don't ripple.
+    """
+    if not text or not text.strip():
+        return _unknown_intent("empty message")
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return _unknown_intent("GROQ_API_KEY not set")
+
+    try:
+        raw = await asyncio.to_thread(_call_groq_intent_sync, api_key, text)
+    except Exception as exc:  # noqa: BLE001 — groq/sdk/network surface too many types
+        log.warning("parse_trade_intent Groq call failed: %s", exc)
+        return _unknown_intent(f"model error: {exc}")
+
+    stripped = _strip_code_fences(raw)
+    if not stripped:
+        return _unknown_intent("empty model response")
+
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, TypeError) as exc:
+        log.warning("parse_trade_intent JSON decode failed: %s | raw=%r", exc, raw[:500])
+        return _unknown_intent("invalid JSON from model")
+
+    if not isinstance(parsed, dict):
+        return _unknown_intent("model returned non-object")
+
+    intent = str(parsed.get("intent", "")).lower().strip()
+    if intent not in VALID_INTENT_KINDS:
+        parsed["intent"] = "unknown"
+        parsed.setdefault(
+            "notes",
+            f"Unsupported intent {intent!r}",
+        )
+    else:
+        parsed["intent"] = intent
+
+    # Normalize asset to upper-case; leave Decimal-looking fields as strings.
+    asset = parsed.get("asset")
+    if isinstance(asset, str) and asset:
+        parsed["asset"] = asset.split(":")[-1].upper()
+
+    side = parsed.get("side")
+    if isinstance(side, str):
+        lowered = side.lower().strip()
+        parsed["side"] = lowered if lowered in ("long", "short") else None
+
+    order_type = parsed.get("order_type")
+    if isinstance(order_type, str):
+        lowered = order_type.lower().strip()
+        parsed["order_type"] = lowered if lowered in ("market", "limit") else None
+
+    timeframe = parsed.get("timeframe")
+    if isinstance(timeframe, str):
+        lowered = timeframe.lower().strip()
+        parsed["timeframe"] = lowered if lowered in VALID_INTERVALS else None
+
+    return parsed
+
+
+async def fetch_spot_price(asset: str) -> Optional[Decimal]:
+    """Fetch the latest spot price (USDT quote) from Binance.
+
+    Returns ``None`` on any network/parse failure so the caller can degrade
+    gracefully. Never raises.
+    """
+    if not asset:
+        return None
+    symbol = binance_symbol(asset)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": symbol},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — any failure degrades to None
+        log.warning("fetch_spot_price %s failed: %s", symbol, exc)
+        return None
+    price = data.get("price") if isinstance(data, dict) else None
+    if price is None:
+        log.warning("fetch_spot_price %s missing 'price': %s", symbol, data)
+        return None
+    try:
+        return Decimal(str(price))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        log.warning("fetch_spot_price %s decimal parse failed: %s", symbol, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Pending trade store (module-level, swept every 30s from bot.py)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -124,6 +323,23 @@ class PendingTrade:
 
 PENDING_TRADES: Dict[str, PendingTrade] = {}
 PENDING_TTL_SECONDS = 300  # 5 minutes
+
+
+@dataclass
+class PendingIntent:
+    """A parsed NL trade intent awaiting Execute/Cancel confirmation."""
+
+    pending_id: str
+    chat_id: int
+    intent: Dict[str, Any]              # the parsed intent from Groq
+    resolved_qty: Optional[Decimal]     # quantity after usd_amount → qty conversion
+    price_at_parse: Optional[Decimal]   # spot price used to compute resolved_qty
+    created_at: datetime                # UTC
+    message_id: Optional[int] = None
+    notes: List[str] = field(default_factory=list)  # user-visible quirks (clamps, defaults)
+
+
+PENDING_INTENTS: Dict[str, PendingIntent] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -738,18 +954,21 @@ def parse_groq_recommendation(text: str) -> Dict[str, Any]:
 async def sweep_pending_trades(bot: Any) -> None:
     """Remove expired pending trades and edit the Telegram message.
 
-    Runs forever — start it as a background task from ``bot.py``.
+    Runs forever — start it as a background task from ``bot.py``. Sweeps both
+    :data:`PENDING_TRADES` (``/analysis`` flow) and :data:`PENDING_INTENTS`
+    (natural-language ``/trade`` flow) on the same 30s cadence.
     """
     while True:
         try:
             await asyncio.sleep(30)
             now = datetime.now(timezone.utc)
-            expired = [
+
+            expired_trades = [
                 pid
                 for pid, pt in PENDING_TRADES.items()
                 if (now - pt.created_at).total_seconds() > PENDING_TTL_SECONDS
             ]
-            for pid in expired:
+            for pid in expired_trades:
                 pt = PENDING_TRADES.pop(pid, None)
                 if pt is None:
                     continue
@@ -769,6 +988,32 @@ async def sweep_pending_trades(bot: Any) -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug("send expired notice failed: %s", exc)
+
+            expired_intents = [
+                pid
+                for pid, pi in PENDING_INTENTS.items()
+                if (now - pi.created_at).total_seconds() > PENDING_TTL_SECONDS
+            ]
+            for pid in expired_intents:
+                pi = PENDING_INTENTS.pop(pid, None)
+                if pi is None:
+                    continue
+                if pi.message_id is not None:
+                    try:
+                        await bot.edit_message_reply_markup(
+                            chat_id=pi.chat_id,
+                            message_id=pi.message_id,
+                            reply_markup=None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("edit_message_reply_markup failed: %s", exc)
+                try:
+                    await bot.send_message(
+                        chat_id=pi.chat_id,
+                        text="⏰ Intent confirmation expired. Send it again.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("send expired intent notice failed: %s", exc)
         except asyncio.CancelledError:
             log.info("pending trade sweeper cancelled")
             raise
@@ -839,8 +1084,6 @@ Suggested leverage: n/a
 Waiting for a clean break of 3,520 with volume, or rejection at 3,450.
 """
 
-    import json
-
     def _dump(label: str, result: Dict[str, Any]) -> None:
         print(f"--- {label} ---")
         # Decimal → str so json.dumps works
@@ -849,3 +1092,25 @@ Waiting for a clean break of 3,520 with volume, or rejection at 3,450.
 
     _dump("LONG sample", parse_groq_recommendation(_SAMPLE_LONG))
     _dump("NO TRADE sample", parse_groq_recommendation(_SAMPLE_NO_TRADE))
+
+    # Intent parser smoke test — runs only if GROQ_API_KEY is set so the
+    # module stays importable/runnable offline.
+    _INTENT_SAMPLES = [
+        "open long on btc with $4000 and 5x leverage",
+        "close my eth",
+        "analyze sol 4h",
+    ]
+
+    if not os.getenv("GROQ_API_KEY"):
+        print("--- intent parser smoke: skipped (GROQ_API_KEY not set) ---")
+    else:
+        print("--- intent parser smoke ---")
+        logging.basicConfig(level=logging.INFO)
+
+        async def _run_intent_smoke() -> None:
+            for sample in _INTENT_SAMPLES:
+                result = await parse_trade_intent(sample)
+                print(f"input: {sample!r}")
+                print(json.dumps(result, indent=2, default=str))
+
+        asyncio.run(_run_intent_smoke())
