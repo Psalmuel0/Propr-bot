@@ -19,10 +19,15 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://api.propr.xyz/v1"
 
 # Assets on Hyperliquid's HIP-3 rail (equities / commodities) need a ``xyz:``
-# prefix; crypto perps (BTC, ETH, ...) pass through as-is.
-HIP3_ASSETS = frozenset(
-    {"AAPL", "TSLA", "NVDA", "MSFT", "META", "GOOGL", "AMZN", "GOLD", "SILVER", "OIL"}
-)
+# prefix; crypto perps (BTC, ETH, ...) pass through as-is. Ticker *output*
+# may differ from the user-facing alias — e.g. "OIL" routes to the
+# ``xyz:CL`` WTI-crude perp (PR #1 review finding #8).
+HIP3_ASSETS: Dict[str, str] = {
+    "AAPL": "AAPL", "TSLA": "TSLA", "NVDA": "NVDA", "MSFT": "MSFT",
+    "META": "META", "GOOGL": "GOOGL", "AMZN": "AMZN",
+    "GOLD": "GOLD", "SILVER": "SILVER",
+    "OIL": "CL", "CL": "CL",
+}
 
 # Per-asset leverage caps enforced before any margin-config PUT.
 MAX_LEVERAGE_BTC_ETH = 5
@@ -51,7 +56,8 @@ def normalize_asset(asset: str) -> str:
         return asset
     upper = asset.upper()
     if upper in HIP3_ASSETS:
-        return f"xyz:{upper}"
+        # Use the mapped venue ticker so aliases (OIL → CL) route correctly.
+        return f"xyz:{HIP3_ASSETS[upper]}"
     return upper
 
 
@@ -247,7 +253,20 @@ class ProprClient:
         )
         if not config_id:
             raise ProprAPIError(404, f"Could not find margin configId for {asset_norm}")
-        body = {"leverage": int(leverage)}
+        # Propr's margin-config PUT requires the full object, not just ``leverage``
+        # (PR #1 review finding #2). Default marginMode to the existing value if
+        # present, else fall back to ``cross``.
+        margin_mode = "cross"
+        if isinstance(config, dict):
+            mm = config.get("marginMode") or config.get("margin_mode")
+            if mm:
+                margin_mode = str(mm)
+        body = {
+            "exchange": "hyperliquid",
+            "asset": asset_norm,
+            "marginMode": margin_mode,
+            "leverage": int(leverage),
+        }
         return await self._request(
             "PUT", f"/accounts/{account_id}/margin-config/{config_id}", json=body
         )
@@ -312,12 +331,18 @@ class ProprClient:
     async def cancel_order(self, account_id: str, order_id: str) -> Dict[str, Any]:
         """Cancel a single order.
 
-        A ``400`` response is treated as "already filled/cancelled": logged and
-        returned as a soft-success dict instead of raising. All other non-2xx
-        statuses raise :class:`ProprAPIError`.
+        A ``400`` response is treated as "already filled/cancelled": returned
+        as a soft-success ``{"status": "already_done", ...}`` dict instead of
+        raising. All other non-2xx statuses raise :class:`ProprAPIError`.
+
+        Note (PR #1 review finding #13): ``allow_status=(400,)`` means the
+        request helper returns the 400 body instead of raising, so the
+        detection has to inspect the response dict here. The outer
+        ``except ProprAPIError`` is kept as belt-and-braces for the rare
+        edge case where the body isn't JSON and we fall through to raising.
         """
         try:
-            return await self._request(
+            result = await self._request(
                 "POST",
                 f"/accounts/{account_id}/orders/{order_id}/cancel",
                 allow_status=(400,),
@@ -327,6 +352,11 @@ class ProprClient:
                 log.info("cancel_order %s returned 400 (already done): %s", order_id, exc.body)
                 return {"status": "already_done", "orderId": order_id}
             raise
+
+        if _looks_like_already_done(result):
+            log.info("cancel_order %s already done: %s", order_id, result)
+            return {"status": "already_done", "orderId": order_id}
+        return result
 
     # ------------------------------------------------------------------
     # Convenience shortcuts
@@ -418,10 +448,32 @@ class ProprClient:
 
         ``side`` is the *current* position side (``long`` or ``short``); the
         closing order uses the opposite taker side.
+
+        Note (PR #1 review finding #1): the Propr API rejects ``quantity="0"``
+        on a close, so we look up the actual open position and send its real
+        quantity. Raises :class:`ProprAPIError` if no matching open position
+        exists on this ``(asset, side)`` pair.
         """
         position_side = side.lower()
         if position_side not in ("long", "short"):
             raise ValueError("side must be 'long' or 'short'")
+
+        asset_norm_upper = normalize_asset(asset).split(":")[-1].upper()
+        positions = await self.get_positions(account_id)
+        target: Optional[Dict[str, Any]] = None
+        for p in positions:
+            p_asset = str(p.get("asset", "")).split(":")[-1].upper()
+            p_side = str(p.get("positionSide") or p.get("side") or "").lower()
+            p_qty = str(p.get("quantity", p.get("qty", "0")))
+            if p_asset == asset_norm_upper and p_side == position_side and p_qty not in ("0", "0.0", "0.00", ""):
+                target = p
+                break
+        if target is None:
+            raise ProprAPIError(
+                404, f"No open {position_side} position on {asset} to close"
+            )
+
+        quantity = str(target.get("quantity", target.get("qty", "0")))
         taker_side = "sell" if position_side == "long" else "buy"
         return await self.place_order(
             account_id=account_id,
@@ -430,7 +482,7 @@ class ProprClient:
             side=taker_side,
             positionSide=position_side,
             timeInForce="IOC",
-            quantity="0",
+            quantity=quantity,
             reduceOnly=True,
             closePosition=True,
         )
@@ -493,6 +545,25 @@ class ProprClient:
 # ----------------------------------------------------------------------
 # Private helpers
 # ----------------------------------------------------------------------
+def _looks_like_already_done(body: Any) -> bool:
+    """Detect "order already filled/cancelled" 400 sentinels in a body dict.
+
+    Propr surfaces these under a handful of shapes
+    (``message: "BAD_REQUEST"``, ``code: 13053``, ``status: 400``); rather
+    than string-match the text, check each known shape. Called from
+    :meth:`ProprClient.cancel_order` — see PR #1 review finding #13.
+    """
+    if not isinstance(body, dict):
+        return False
+    if str(body.get("message", "")).lower() == "bad_request":
+        return True
+    if body.get("code") == 13053:
+        return True
+    if body.get("status") == 400:
+        return True
+    return False
+
+
 def _as_list(data: Any) -> List[Dict[str, Any]]:
     """Unwrap list / {data:[...]} / {items:[...]} shapes into a plain list."""
     if isinstance(data, list):

@@ -564,12 +564,23 @@ def _parse_direction(text: str) -> str:
     return "no_trade"
 
 
+# Accept only these exact tokens as "market" entry; anything else with a
+# digit is treated as a limit price. See PR #1 review finding #4.
+_MARKET_ENTRY_TOKENS = frozenset({"market", "market order", "at market"})
+
+
 def _parse_entry(text: str) -> tuple[str, Optional[Decimal]]:
     """Return ``(order_type, entry_price)`` parsed from ``Entry zone:``.
 
-    - Plain word ``market`` → ``("market", None)``.
+    - Exact ``market`` / ``market order`` / ``at market`` (with no digits on
+      the line) → ``("market", None)``.
     - Single number → ``("limit", Decimal)``.
     - Range of two numbers → ``("limit", midpoint)``.
+
+    Prior behavior treated any substring "market" as market (finding #4) —
+    so ``"sweep the market at 94500"`` turned into a market order. Now we
+    require an exact token match and zero digits on the line before
+    returning market.
     """
     line = _line_after(text, "Entry zone")
     if not line:
@@ -577,23 +588,45 @@ def _parse_entry(text: str) -> tuple[str, Optional[Decimal]]:
     if not line:
         return "market", None
 
-    low = line.lower()
-    if "market" in low:
+    stripped = line.strip().lower()
+    if stripped in _MARKET_ENTRY_TOKENS and not any(c.isdigit() for c in line):
         return "market", None
 
     nums = _all_decimals(line)
     if not nums:
         return "market", None
+    low = stripped
     if len(nums) >= 2 and ("-" in line or "–" in line or "—" in line or "to" in low):
         mid = (nums[0] + nums[1]) / Decimal(2)
         return "limit", mid
     return "limit", nums[0]
 
 
+# Tokens that signal the suggested size is a percentage / notional and NOT a
+# raw quantity we can pass to the exchange; reject these to avoid placing
+# massively wrong orders. See PR #1 review finding #5.
+_SIZE_NON_QUANTITY_TOKENS = (
+    "%", "percent", "$", "usd", "usdc", "notional",
+    "of account", "of balance",
+)
+_SIZE_QUANTITY_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]{2,10})?\s*$")
+
+
 def _parse_size(text: str) -> Optional[Decimal]:
-    """Extract quantity (first number) from ``Suggested size:``."""
+    """Extract quantity (first number) from ``Suggested size:``.
+
+    Returns ``None`` when the line looks like a percentage / notional / USDC
+    value (the caller treats ``None`` as non-executable). Also returns
+    ``None`` if the line doesn't match ``<number> <asset>?`` — anything
+    shaped unambiguously like a raw quantity.
+    """
     line = _line_after(text, "Suggested size")
     if not line:
+        return None
+    lowered = line.lower()
+    if any(tok in lowered for tok in _SIZE_NON_QUANTITY_TOKENS):
+        return None
+    if not _SIZE_QUANTITY_RE.match(line):
         return None
     return _first_decimal(line)
 
