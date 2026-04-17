@@ -29,9 +29,14 @@ from telegram.ext import ContextTypes
 from ulid import ULID
 
 from analysis import (
+    PENDING_INTENTS,
     PENDING_TRADES,
+    VALID_INTERVALS,
+    PendingIntent,
     PendingTrade,
+    fetch_spot_price,
     parse_groq_recommendation,
+    parse_trade_intent,
     run_analysis,
 )
 from pnl import build_snapshot, format_snapshot_markdown, render_snapshot_image
@@ -679,7 +684,6 @@ async def leverage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 @authorized
 async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/analysis <asset> [timeframe] [direction]`` — expert AI analysis."""
-    typing_task: Optional[asyncio.Task] = None
     try:
         args = parse_args(context, 1, 3)
         if args is None:
@@ -692,7 +696,6 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # PR #1 review finding #10 — gate on a whitelist so we don't kick off a
         # Groq call with a bogus interval that Binance will reject.
-        from analysis import VALID_INTERVALS
         if timeframe not in VALID_INTERVALS:
             await _reply(
                 update,
@@ -700,10 +703,47 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        chat_id = update.effective_chat.id
+        await _run_analysis_flow(
+            context,
+            chat_id=update.effective_chat.id,
+            asset=asset,
+            timeframe=timeframe,
+            direction=direction,
+            intro_reply=update.effective_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _report_error(update, exc)
 
+
+async def _run_analysis_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    asset: str,
+    timeframe: str,
+    direction: Optional[str],
+    intro_reply: Any,
+) -> None:
+    """Shared ``/analysis`` pipeline — reused by the NL ``analysis`` intent.
+
+    Sends the intro line, runs the Groq analysis with a typing indicator,
+    chunks the response, attaches the Execute/Skip keyboard when the parsed
+    recommendation is auto-executable, and stores a :class:`PendingTrade`.
+    """
+    typing_task: Optional[asyncio.Task] = None
+    try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        await _reply(update, f"🔍 Analyzing {escape_md(asset)}\\.\\.\\.")
+        if intro_reply is not None:
+            await intro_reply.reply_text(
+                f"🔍 Analyzing {escape_md(asset)}\\.\\.\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔍 Analyzing {escape_md(asset)}\\.\\.\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
 
         async def _typing_loop() -> None:
             try:
@@ -787,8 +827,6 @@ async def analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
-    except Exception as exc:  # noqa: BLE001
-        await _report_error(update, exc)
     finally:
         if typing_task and not typing_task.done():
             typing_task.cancel()
@@ -806,7 +844,13 @@ def _callback_authorized(query_chat_id: int) -> bool:
 
 
 async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle ``exec_trade`` and ``skip_trade`` inline-button clicks."""
+    """Handle ``exec_trade`` / ``skip_trade`` and ``exec_intent`` / ``skip_intent`` clicks.
+
+    - ``exec_trade`` / ``skip_trade`` come from the ``/analysis`` flow.
+    - ``exec_intent`` / ``skip_intent`` come from natural-language ``/trade``
+      confirmations.
+    Routing is strictly by prefix so the two stores never collide.
+    """
     query = update.callback_query
     if query is None:
         return
@@ -817,12 +861,26 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     data = query.data or ""
-    try:
-        action, _, pending_id = data.partition(":")
-    except ValueError:
-        await query.answer("Invalid callback")
+    action, _, pending_id = data.partition(":")
+
+    if action in ("exec_trade", "skip_trade"):
+        await _handle_analysis_callback(context, query, chat.id, action, pending_id)
+        return
+    if action in ("exec_intent", "skip_intent"):
+        await _handle_intent_callback(context, query, chat.id, action, pending_id)
         return
 
+    await query.answer("Unknown action")
+
+
+async def _handle_analysis_callback(
+    context: ContextTypes.DEFAULT_TYPE,
+    query: Any,
+    chat_id: int,
+    action: str,
+    pending_id: str,
+) -> None:
+    """Route a callback for the ``/analysis`` confirmation keyboard."""
     pending = PENDING_TRADES.get(pending_id)
     if pending is None:
         await query.answer("Expired")
@@ -837,15 +895,9 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Skipped")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
-            await context.bot.send_message(
-                chat_id=chat.id, text="❎ Trade skipped."
-            )
+            await context.bot.send_message(chat_id=chat_id, text="❎ Trade skipped.")
         except Exception as exc:  # noqa: BLE001
             log.debug("skip cleanup failed: %s", exc)
-        return
-
-    if action != "exec_trade":
-        await query.answer("Unknown action")
         return
 
     await query.answer("Executing…")
@@ -861,7 +913,7 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if parsed.get("direction") == "no_trade" or not parsed.get("executable"):
         await context.bot.send_message(
-            chat_id=chat.id,
+            chat_id=chat_id,
             text=(
                 "⚠️ Could not auto-parse trade parameters. "
                 "Review analysis and place manually with /buy or /sell."
@@ -869,7 +921,7 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await _execute_parsed_trade(context, chat.id, pending.asset, parsed)
+    await _execute_parsed_trade(context, chat_id, pending.asset, parsed)
 
 
 async def _execute_parsed_trade(
@@ -1067,6 +1119,726 @@ def _half_qty(qty: Decimal) -> Decimal:
 
 
 # ---------------------------------------------------------------------------
+# Natural-language trade intents — /trade + free-form text handler
+# ---------------------------------------------------------------------------
+_INTENT_REQUIRED_FIELDS: dict[str, Tuple[str, ...]] = {
+    "open": ("asset", "side"),                 # quantity/usd_amount validated separately
+    "close": ("asset",),
+    "sl": ("asset", "stop_loss"),
+    "tp": ("asset", "take_profit"),
+    "setleverage": ("asset", "leverage"),
+    "analysis": ("asset",),
+}
+
+
+def _intent_decimal(value: Any) -> Optional[Decimal]:
+    """Coerce an intent JSON string/number to ``Decimal``; ``None`` on failure."""
+    if value is None or value == "":
+        return None
+    try:
+        d = Decimal(str(value).replace(",", "").replace("_", ""))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return d
+
+
+def _intent_int(value: Any) -> Optional[int]:
+    """Coerce an intent JSON value to ``int``; ``None`` on failure."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(str(value)))
+    except (ValueError, TypeError):
+        return None
+
+
+def _quantize_qty(qty: Decimal, price: Decimal) -> Decimal:
+    """Round a computed quantity to a sensible precision for the asset price.
+
+    Cheap assets (price < $10, e.g. DOGE / PEPE) get 6 dp; everything else 4 dp.
+    """
+    step = Decimal("0.000001") if price < Decimal(10) else Decimal("0.0001")
+    return qty.quantize(step)
+
+
+def _intent_missing_fields(intent: dict) -> List[str]:
+    """Return the list of required fields missing for *intent*."""
+    kind = str(intent.get("intent", "")).lower()
+    required = _INTENT_REQUIRED_FIELDS.get(kind, ())
+    missing = [f for f in required if intent.get(f) in (None, "")]
+    if kind == "open":
+        qty = _intent_decimal(intent.get("quantity"))
+        usd = _intent_decimal(intent.get("usd_amount"))
+        if qty is None and usd is None:
+            missing.append("quantity or usd_amount")
+    return missing
+
+
+def _render_intent_card(
+    intent: dict,
+    resolved_qty: Optional[Decimal],
+    price_at_parse: Optional[Decimal],
+    extra_notes: List[str],
+) -> str:
+    """Build the MarkdownV2 confirmation card shown before execution."""
+    kind = str(intent.get("intent", "")).lower()
+    asset = str(intent.get("asset", "?"))
+    side = str(intent.get("side") or "").lower()
+    leverage = _intent_int(intent.get("leverage"))
+    order_type = str(intent.get("order_type") or "market").lower()
+    notes = str(intent.get("notes") or "")
+
+    header = "🧠 *Parsed intent*"
+    lines: List[str] = [header]
+
+    if kind == "open":
+        action = f"OPEN {side.upper() or '?'}"
+        lines.append(f"Action: {escape_md(action)}")
+        lines.append(f"Asset: {escape_md(asset)}")
+
+        qty_str = fmt_num(resolved_qty, 6) if resolved_qty is not None else "?"
+        usd_amount = _intent_decimal(intent.get("usd_amount"))
+        lev_label = f"{leverage}x" if leverage else "1x"
+        if usd_amount is not None and resolved_qty is not None:
+            lines.append(
+                f"Size: {escape_md(qty_str)} {escape_md(asset)} "
+                f"\\(≈ ${escape_md(fmt_num(usd_amount))} @ {escape_md(lev_label)}\\)"
+            )
+        else:
+            lines.append(f"Size: {escape_md(qty_str)} {escape_md(asset)}")
+
+        if order_type == "limit":
+            limit_price = _intent_decimal(intent.get("limit_price"))
+            price_desc = f"limit @ {fmt_num(limit_price)}" if limit_price else "limit"
+            lines.append(f"Entry: {escape_md(price_desc)}")
+        else:
+            lines.append("Entry: market")
+
+        if leverage:
+            lines.append(f"Leverage: {escape_md(lev_label)}")
+
+        sl = _intent_decimal(intent.get("stop_loss"))
+        tp = _intent_decimal(intent.get("take_profit"))
+        if sl is not None:
+            lines.append(f"SL: {escape_md(fmt_num(sl))}")
+        if tp is not None:
+            lines.append(f"TP: {escape_md(fmt_num(tp))}")
+
+    elif kind == "close":
+        side_label = side.upper() if side else "AUTO"
+        lines.append(f"Action: CLOSE {escape_md(side_label)}")
+        lines.append(f"Asset: {escape_md(asset)}")
+
+    elif kind == "sl":
+        sl = _intent_decimal(intent.get("stop_loss"))
+        lines.append("Action: SET STOP\\-LOSS")
+        lines.append(f"Asset: {escape_md(asset)}")
+        lines.append(f"Trigger: {escape_md(fmt_num(sl))}")
+
+    elif kind == "tp":
+        tp = _intent_decimal(intent.get("take_profit"))
+        lines.append("Action: SET TAKE\\-PROFIT")
+        lines.append(f"Asset: {escape_md(asset)}")
+        lines.append(f"Trigger: {escape_md(fmt_num(tp))}")
+
+    elif kind == "setleverage":
+        lev_label = f"{leverage}x" if leverage else "?"
+        lines.append("Action: SET LEVERAGE")
+        lines.append(f"Asset: {escape_md(asset)}")
+        lines.append(f"Leverage: {escape_md(lev_label)}")
+
+    elif kind == "analysis":
+        timeframe = str(intent.get("timeframe") or "1h")
+        lines.append("Action: ANALYSIS")
+        lines.append(f"Asset: {escape_md(asset)}")
+        lines.append(f"Timeframe: {escape_md(timeframe)}")
+
+    lines.append("─" * 16)
+    if notes:
+        lines.append(f'"{escape_md(notes)}"')
+    for extra in extra_notes:
+        lines.append(f"_{escape_md(extra)}_")
+    return "\n".join(lines)
+
+
+@authorized
+async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/trade <natural language prompt>``
+
+    Same behavior as sending the prompt as a plain message — useful when the
+    first word looks like a reserved command (e.g. ``close`` is not a slash
+    command but we want it to route as a close intent).
+    """
+    try:
+        text = " ".join(context.args or []).strip()
+        if not text:
+            await _reply(
+                update,
+                'Usage: `/trade <prompt>` \\(e\\.g\\. `/trade open long on btc with $4000`\\)',
+            )
+            return
+        await _process_prompt(update, context, text)
+    except Exception as exc:  # noqa: BLE001
+        await _report_error(update, exc)
+
+
+@authorized
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle any non-command text message as a natural-language trade intent."""
+    try:
+        message = update.effective_message
+        if message is None:
+            return
+        text = (message.text or "").strip()
+        if not text:
+            return
+        if text.startswith("/"):
+            # The MessageHandler filter already excludes commands; this is just
+            # a safety net for edge cases (e.g. forwarded messages with a
+            # leading slash).
+            return
+        await _process_prompt(update, context, text)
+    except Exception as exc:  # noqa: BLE001
+        await _report_error(update, exc)
+
+
+async def _process_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    """Shared NL core: Groq parse → resolve qty → show confirmation card."""
+    chat_id = update.effective_chat.id
+
+    # Step 1: typing indicator + "thinking" placeholder so the user sees
+    # something while Groq is running.
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    placeholder = await context.bot.send_message(
+        chat_id=chat_id, text="✍️ Thinking..."
+    )
+
+    async def _typing_loop() -> None:
+        try:
+            while True:
+                await asyncio.sleep(4)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.TYPING
+                )
+        except asyncio.CancelledError:
+            return
+
+    typing_task = asyncio.create_task(_typing_loop())
+    try:
+        intent = await parse_trade_intent(text)
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+
+    # Drop the placeholder now that we have a result.
+    try:
+        await context.bot.delete_message(
+            chat_id=chat_id, message_id=placeholder.message_id
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+        log.debug("delete placeholder failed: %s", exc)
+
+    kind = str(intent.get("intent", "")).lower()
+    notes_text = str(intent.get("notes") or "").strip()
+
+    if kind == "unknown" or kind == "":
+        reason = notes_text or "Intent not recognised"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❓ Sorry, I couldn't parse that\\. {escape_md(reason)}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # Normalize / upper-case asset (parser already does this, defensive copy).
+    if isinstance(intent.get("asset"), str):
+        intent["asset"] = intent["asset"].split(":")[-1].upper()
+
+    missing = _intent_missing_fields(intent)
+    if missing:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Missing fields for {escape_md(kind)}: "
+                f"`{escape_md(', '.join(missing))}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    extra_notes: List[str] = []
+    resolved_qty: Optional[Decimal] = None
+    price_at_parse: Optional[Decimal] = None
+
+    # Step 2: open-intent qty resolution + leverage clamp.
+    if kind == "open":
+        asset = str(intent["asset"])
+        qty_raw = _intent_decimal(intent.get("quantity"))
+        usd_raw = _intent_decimal(intent.get("usd_amount"))
+        leverage = _intent_int(intent.get("leverage"))
+
+        if leverage is not None:
+            cap = max_leverage_for(asset)
+            if leverage > cap:
+                extra_notes.append(f"Leverage clamped to {cap}x (max for {asset}).")
+                leverage = cap
+                intent["leverage"] = cap
+            elif leverage <= 0:
+                extra_notes.append("Leverage ≤ 0 ignored; using 1x.")
+                leverage = None
+                intent["leverage"] = None
+
+        if qty_raw is not None and qty_raw > 0:
+            resolved_qty = qty_raw
+        elif usd_raw is not None and usd_raw > 0:
+            price = await fetch_spot_price(asset)
+            if price is None or price <= 0:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ Could not fetch {escape_md(asset)} price — try again "
+                        "or specify quantity directly\\."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
+            lev_mul = Decimal(leverage) if leverage else Decimal(1)
+            try:
+                raw_qty = (usd_raw * lev_mul) / price
+            except (InvalidOperation, ZeroDivisionError) as exc:
+                log.warning("qty compute failed: %s", exc)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Could not compute quantity: {escape_md(exc)}",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
+            resolved_qty = _quantize_qty(raw_qty, price)
+            price_at_parse = price
+            if resolved_qty <= 0:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ Computed quantity rounded to zero — try a larger "
+                        "USD amount or specify the size directly\\."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+                return
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Need a quantity or USD amount for open intents\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+    # Step 3: setleverage clamp (independent of open).
+    if kind == "setleverage":
+        asset = str(intent["asset"])
+        leverage = _intent_int(intent.get("leverage"))
+        if leverage is None or leverage <= 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Leverage must be a positive integer\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        cap = max_leverage_for(asset)
+        if leverage > cap:
+            extra_notes.append(f"Leverage clamped to {cap}x (max for {asset}).")
+            leverage = cap
+            intent["leverage"] = cap
+
+    # Step 4: analysis timeframe default.
+    if kind == "analysis":
+        tf = intent.get("timeframe")
+        if not tf or tf not in VALID_INTERVALS:
+            if tf:
+                extra_notes.append(f"Unknown timeframe {tf!r}; defaulting to 1h.")
+            intent["timeframe"] = "1h"
+
+    # Step 5: render confirmation card + keyboard.
+    pending_id = str(ULID())
+    card = _render_intent_card(intent, resolved_qty, price_at_parse, extra_notes)
+
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ Execute", callback_data=f"exec_intent:{pending_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Cancel", callback_data=f"skip_intent:{pending_id}"
+            ),
+        ]]
+    )
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=card,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=keyboard,
+    )
+
+    PENDING_INTENTS[pending_id] = PendingIntent(
+        pending_id=pending_id,
+        chat_id=chat_id,
+        intent=intent,
+        resolved_qty=resolved_qty,
+        price_at_parse=price_at_parse,
+        created_at=datetime.now(timezone.utc),
+        message_id=sent.message_id,
+        notes=list(extra_notes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Intent callback dispatch
+# ---------------------------------------------------------------------------
+async def _handle_intent_callback(
+    context: ContextTypes.DEFAULT_TYPE,
+    query: Any,
+    chat_id: int,
+    action: str,
+    pending_id: str,
+) -> None:
+    """Route an ``exec_intent`` / ``skip_intent`` callback to execution."""
+    pending = PENDING_INTENTS.get(pending_id)
+    if pending is None:
+        await query.answer("Expired")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("edit_message_reply_markup on expired intent failed: %s", exc)
+        return
+
+    if action == "skip_intent":
+        PENDING_INTENTS.pop(pending_id, None)
+        await query.answer("Cancelled")
+        try:
+            original_md = query.message.text_markdown_v2 or ""
+            await query.edit_message_text(
+                text=original_md + "\n\n⏭ Skipped",
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("skip intent cleanup failed: %s", exc)
+        return
+
+    # action == "exec_intent"
+    await query.answer("Executing…")
+
+    PENDING_INTENTS.pop(pending_id, None)
+
+    try:
+        summary = await _execute_intent(context, chat_id, pending)
+    except ProprAPIError as exc:
+        await _append_status_to_intent_message(query, f"❌ {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 — never crash the callback handler
+        log.exception("intent execution failed: %s", exc)
+        await _append_status_to_intent_message(
+            query, f"❌ Unexpected error: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    await _append_status_to_intent_message(query, f"✅ Executed\n{summary}")
+
+
+async def _append_status_to_intent_message(query: Any, status: str) -> None:
+    """Append a status line (already plain text) to the intent confirmation card."""
+    try:
+        original_md = query.message.text_markdown_v2 or ""
+        new_text = (original_md + "\n\n" + escape_md(status)).strip()
+        await query.edit_message_text(
+            text=new_text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — fall back to a fresh message
+        log.debug("edit status onto intent message failed: %s", exc)
+        try:
+            await query.message.reply_text(status)
+        except Exception as reply_exc:  # noqa: BLE001
+            log.debug("fallback status send failed: %s", reply_exc)
+
+
+async def _execute_intent(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    pending: "PendingIntent",
+) -> str:
+    """Dispatch a confirmed intent to the right Propr/analysis call.
+
+    Returns a short human-readable summary of what was done. Raises
+    :class:`ProprAPIError` (or any other exception) on failure — the caller
+    translates to a friendly user message.
+    """
+    client = _get_client(context)
+    account_id = await _ensure_account_id(context)
+
+    intent = pending.intent
+    kind = str(intent.get("intent", "")).lower()
+    asset = str(intent.get("asset") or "").upper()
+
+    if kind == "open":
+        return await _execute_intent_open(
+            client, account_id, context, chat_id, pending
+        )
+    if kind == "close":
+        return await _execute_intent_close(client, account_id, intent)
+    if kind == "sl":
+        return await _execute_intent_sl(client, account_id, intent)
+    if kind == "tp":
+        return await _execute_intent_tp(client, account_id, intent)
+    if kind == "setleverage":
+        return await _execute_intent_set_leverage(client, account_id, intent)
+    if kind == "analysis":
+        timeframe = str(intent.get("timeframe") or "1h")
+        asyncio.create_task(
+            _run_analysis_flow(
+                context,
+                chat_id=chat_id,
+                asset=asset,
+                timeframe=timeframe,
+                direction=intent.get("side"),
+                intro_reply=None,
+            )
+        )
+        return f"Queued analysis for {asset} ({timeframe})"
+    raise ProprAPIError(400, f"Unsupported intent: {kind}")
+
+
+async def _execute_intent_open(
+    client: ProprClient,
+    account_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    pending: "PendingIntent",
+) -> str:
+    """Execute an ``open`` intent: optional leverage + entry + optional SL/TP."""
+    intent = pending.intent
+    asset = str(intent.get("asset") or "")
+    side = str(intent.get("side") or "").lower()
+    if side not in ("long", "short"):
+        raise ProprAPIError(400, "open intent requires side=long|short")
+    leverage = _intent_int(intent.get("leverage"))
+    order_type = str(intent.get("order_type") or "market").lower()
+    limit_price = _intent_decimal(intent.get("limit_price"))
+    stop_loss = _intent_decimal(intent.get("stop_loss"))
+    take_profit = _intent_decimal(intent.get("take_profit"))
+
+    quantity = pending.resolved_qty
+    if quantity is None:
+        quantity = _intent_decimal(intent.get("quantity"))
+    if quantity is None or quantity <= 0:
+        raise ProprAPIError(400, "open intent has no usable quantity")
+
+    taker_side = "buy" if side == "long" else "sell"
+    opposite_side = "sell" if taker_side == "buy" else "buy"
+
+    # Leverage step — only when the user specified one. Match existing
+    # analysis-execute behavior: compare against current margin config and
+    # only PUT if it changed, so we don't trip Propr's rate limits on no-ops.
+    if leverage is not None and leverage > 0:
+        try:
+            current_cfg = await client.get_margin_config(account_id, asset)
+            if (
+                isinstance(current_cfg, dict)
+                and "data" in current_cfg
+                and isinstance(current_cfg["data"], dict)
+            ):
+                current_cfg = current_cfg["data"]
+            current_lev = None
+            if isinstance(current_cfg, dict):
+                current_lev = current_cfg.get("leverage")
+            try:
+                current_lev_int = (
+                    int(float(current_lev)) if current_lev is not None else None
+                )
+            except (TypeError, ValueError):
+                current_lev_int = None
+            if current_lev_int != leverage:
+                await client.set_leverage(account_id, asset, leverage)
+        except ProprAPIError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ProprAPIError(0, f"leverage step failed: {exc}") from exc
+
+    # Entry step.
+    if order_type == "limit" and limit_price is not None and limit_price > 0:
+        await client.place_order(
+            account_id=account_id,
+            asset=asset,
+            type="limit",
+            side=taker_side,
+            positionSide=side,
+            timeInForce="GTC",
+            quantity=quantity,
+            price=limit_price,
+            reduceOnly=False,
+        )
+        entry_desc = f"limit @ {fmt_num(limit_price)}"
+    else:
+        await client.place_order(
+            account_id=account_id,
+            asset=asset,
+            type="market",
+            side=taker_side,
+            positionSide=side,
+            timeInForce="IOC",
+            quantity=quantity,
+            reduceOnly=False,
+        )
+        entry_desc = "market"
+
+    # Optional SL — rollback pattern: if placement fails after a live entry,
+    # attempt an immediate close (analysis-execute pattern, commit f81820f0).
+    extras: List[str] = []
+    if stop_loss is not None and stop_loss > 0:
+        try:
+            await client.stop_loss(account_id, asset, quantity, stop_loss, side)
+            extras.append(f"SL: {fmt_num(stop_loss)}")
+        except Exception as sl_exc:  # noqa: BLE001
+            try:
+                await client.close_position(account_id, asset, side)
+            except Exception as close_exc:  # noqa: BLE001
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🚨 SL placement failed AND close failed. "
+                        f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                        f"Reasons: SL={sl_exc} | close={close_exc}"
+                    ),
+                )
+                raise ProprAPIError(
+                    0, f"SL failed then close failed — MANUAL INTERVENTION NEEDED ({sl_exc})"
+                ) from sl_exc
+            raise ProprAPIError(
+                0, f"SL placement failed; position closed ({sl_exc})"
+            ) from sl_exc
+
+    # Optional TP — non-fatal; user keeps SL protection.
+    if take_profit is not None and take_profit > 0:
+        try:
+            await client.take_profit(account_id, asset, quantity, take_profit, side)
+            extras.append(f"TP: {fmt_num(take_profit)}")
+        except Exception as tp_exc:  # noqa: BLE001
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ TP placement failed: {tp_exc} — position is still open.",
+            )
+
+    summary = f"Opened {side.upper()} {fmt_num(quantity, 6)} {asset} @ {entry_desc}"
+    if extras:
+        summary += " | " + " | ".join(extras)
+    return summary
+
+
+async def _execute_intent_close(
+    client: ProprClient,
+    account_id: str,
+    intent: dict,
+) -> str:
+    """Execute a ``close`` intent: optional side, auto-detect if missing."""
+    asset = str(intent.get("asset") or "")
+    side = str(intent.get("side") or "").lower()
+
+    if side not in ("long", "short"):
+        positions = await client.get_positions(account_id)
+        target = next(
+            (p for p in positions if _pos_asset_upper(p) == asset),
+            None,
+        )
+        if target is None:
+            raise ProprAPIError(404, f"No open position on {asset}")
+        side = _pos_side(target)
+        if side not in ("long", "short"):
+            raise ProprAPIError(404, f"Could not determine position side for {asset}")
+
+    await client.close_position(account_id, asset, side)
+    return f"Closed {side.upper()} {asset}"
+
+
+async def _execute_intent_sl(
+    client: ProprClient,
+    account_id: str,
+    intent: dict,
+) -> str:
+    """Execute an ``sl`` intent: attach stop-loss to the current position."""
+    asset = str(intent.get("asset") or "")
+    trigger = _intent_decimal(intent.get("stop_loss"))
+    if trigger is None or trigger <= 0:
+        raise ProprAPIError(400, "sl intent requires a positive stop_loss")
+    side_hint = str(intent.get("side") or "").lower()
+
+    positions = await client.get_positions(account_id)
+    candidates = [p for p in positions if _pos_asset_upper(p) == asset]
+    if side_hint in ("long", "short"):
+        candidates = [p for p in candidates if _pos_side(p) == side_hint]
+    target = candidates[0] if candidates else None
+    if target is None:
+        raise ProprAPIError(404, f"No open position on {asset}")
+
+    side = _pos_side(target)
+    if side not in ("long", "short"):
+        raise ProprAPIError(404, f"Could not determine position side for {asset}")
+    qty = target.get("quantity", target.get("qty"))
+    await client.stop_loss(account_id, asset, qty, trigger, side)
+    return f"SL set on {side.upper()} {asset} @ {fmt_num(trigger)}"
+
+
+async def _execute_intent_tp(
+    client: ProprClient,
+    account_id: str,
+    intent: dict,
+) -> str:
+    """Execute a ``tp`` intent: attach take-profit to the current position."""
+    asset = str(intent.get("asset") or "")
+    trigger = _intent_decimal(intent.get("take_profit"))
+    if trigger is None or trigger <= 0:
+        raise ProprAPIError(400, "tp intent requires a positive take_profit")
+    side_hint = str(intent.get("side") or "").lower()
+
+    positions = await client.get_positions(account_id)
+    candidates = [p for p in positions if _pos_asset_upper(p) == asset]
+    if side_hint in ("long", "short"):
+        candidates = [p for p in candidates if _pos_side(p) == side_hint]
+    target = candidates[0] if candidates else None
+    if target is None:
+        raise ProprAPIError(404, f"No open position on {asset}")
+
+    side = _pos_side(target)
+    if side not in ("long", "short"):
+        raise ProprAPIError(404, f"Could not determine position side for {asset}")
+    qty = target.get("quantity", target.get("qty"))
+    await client.take_profit(account_id, asset, qty, trigger, side)
+    return f"TP set on {side.upper()} {asset} @ {fmt_num(trigger)}"
+
+
+async def _execute_intent_set_leverage(
+    client: ProprClient,
+    account_id: str,
+    intent: dict,
+) -> str:
+    """Execute a ``setleverage`` intent."""
+    asset = str(intent.get("asset") or "")
+    leverage = _intent_int(intent.get("leverage"))
+    if leverage is None or leverage <= 0:
+        raise ProprAPIError(400, "setleverage intent requires a positive leverage")
+    await client.set_leverage(account_id, asset, leverage)
+    return f"Leverage on {asset} set to {leverage}x"
+
+
+# ---------------------------------------------------------------------------
 # PnL commands
 # ---------------------------------------------------------------------------
 @authorized
@@ -1163,6 +1935,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/analysis <asset> [tf] [dir]` — AI trade plan\n"
         "• `/pnl [image]` — show realized \\+ unrealized PnL \\(append `image` for PNG card\\)\n"
         "• `/livepnl [on|off]` — toggle real\\-time PnL updates\n"
+        "• Natural language — just type what you want, "
+        'e\\.g\\. _"open long on btc with $4000 and 5x leverage"_\n'
+        "• `/trade <prompt>` — same as above but explicit\n"
         "• `/help` — this message"
     )
     await _reply(update, text)
@@ -1205,6 +1980,7 @@ COMMAND_HANDLERS: List[Tuple[str, HandlerFn]] = [
     ("tp", tp_cmd),
     ("leverage", leverage_cmd),
     ("analysis", analysis_cmd),
+    ("trade", cmd_trade),
     ("pnl", cmd_pnl),
     ("livepnl", cmd_livepnl),
     ("help", help_cmd),
