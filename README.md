@@ -104,6 +104,28 @@ collide with a reserved command name, e.g. `/trade close all btc`).
 
 Confirmations expire after 5 minutes — send the message again to get a fresh card.
 
+## Deploy to Railway
+
+Two ways to ship this to a Railway project:
+
+**A. Nixpacks (default, zero-config)**
+
+1. Push this repo to GitHub.
+2. Railway → New Project → Deploy from GitHub repo → pick `Propr-bot`.
+3. In the service's **Variables** tab add all four env vars from `.env.example`.
+4. Deploy. Railway picks up `nixpacks.toml` + `Procfile`, installs DejaVu fonts for the PnL share card, and runs `python bot.py`.
+
+**B. Dockerfile (pinned base image)**
+
+Railway auto-detects the `Dockerfile` at repo root. Same variables, same outcome. Use this path if you want reproducible builds or to run on Fly/Render/Kubernetes with the same image.
+
+Important notes:
+- This bot is a **long-poll Telegram worker**, not a web service. It does not listen on any port — do not add a Railway `PORT` variable or HTTP healthcheck.
+- The service must run **exactly one replica**. Two replicas will race on Telegram `getUpdates` and duplicate everything.
+- Railway auto-restarts on crash (configured in `railway.toml`, max 10 retries). A 401/403 from the Propr websocket intentionally calls `os._exit(1)` so Railway will restart the container — check logs for "WS auth rejected" if it keeps cycling.
+- Logs stream to Railway's log tab (stdout is unbuffered via `PYTHONUNBUFFERED=1` in the Dockerfile).
+- `TELEGRAM_CHAT_ID` must be your personal numeric id from `@userinfobot`. The bot rejects every other chat with `⛔ Unauthorized`.
+
 ## File structure
 
 - `bot.py` — entry point, wires the Telegram `Application` and background tasks
