@@ -132,9 +132,13 @@ def _make_post_init(api_key: str, chat_id: int):
             # PR #1 review finding #6 \u2014 if the startup checks throw (network,
             # auth, missing account), the httpx client inside ProprClient
             # was previously leaked because we bailed before storing it in
-            # bot_data. Close it explicitly and re-raise.
+            # bot_data. Close it explicitly and re-raise. Review finding 12
+            # widens this to ``BaseException`` so ``SystemExit`` / keyboard
+            # interrupts still flush the client.
             account_id = await _startup_checks(client)
-        except Exception:
+        except BaseException:
+            # review finding 12: ``except Exception`` let SystemExit /
+            # KeyboardInterrupt skip this path and leak the httpx client.
             await client.close()
             raise
 

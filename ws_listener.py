@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
@@ -348,13 +349,29 @@ async def run_ws_listener(
         except InvalidStatusCode as exc:
             # PR #1 review finding #11 — handshake rejections for bad creds
             # must kill the process instead of retrying forever. Other 4xx/5xx
-            # codes fall through to the generic reconnect branch.
+            # codes fall through to the generic reconnect branch. Review
+            # finding 9 promotes this from ``raise SystemExit`` (which only
+            # killed the asyncio task) to ``os._exit(1)`` after a best-effort
+            # Telegram notice, so the whole bot exits on auth failure.
             status = getattr(exc, "status_code", None)
             if status in (401, 403):
                 log.critical("ws handshake rejected with %s: %s", status, exc)
-                raise SystemExit(
-                    f"WS auth rejected ({status}). Check PROPR_API_KEY."
-                ) from exc
+                # review finding 9: notify the authorized chat before forcing
+                # interpreter exit; wrap the send in try/except so a failed
+                # send can't block shutdown.
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text="🛑 WS auth rejected — shutting down. Check PROPR_API_KEY.",
+                    )
+                except Exception as notify_exc:  # noqa: BLE001 — don't block exit
+                    log.warning(
+                        "failed to send ws auth-failure notice: %s", notify_exc
+                    )
+                # os._exit bypasses atexit / asyncio cleanup — required because
+                # SystemExit inside an asyncio task only kills that task, not
+                # the parent process.
+                os._exit(1)
             log.warning("ws handshake returned %s; reconnecting in %ss",
                         status, RECONNECT_DELAY)
         except InvalidHandshake as exc:

@@ -255,6 +255,9 @@ _FONT_PATH_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 _FONT_PATH_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 _FONT_FALLBACK_WARNED = False
+# review finding 5: module-level flag so the bg-missing warning fires once
+# per process instead of spamming on every rendered card.
+_BG_WARNED = False
 
 
 def _font(size: int, bold: bool = True) -> ImageFont.ImageFont:
@@ -360,19 +363,26 @@ def _apply_bg(path: str, w: int, h: int, is_profit: bool, empty: bool) -> Image.
     Falls back to a solid dark color if the JPEG is missing or fails to load.
     The *empty* flag uses the neutral (cool green) tint so the empty-state
     card doesn't misrepresent account state.
+
+    Review finding 5 hardens this further: on any ``Image.open`` failure (or
+    a missing file) we emit a single module-level warning via ``_BG_WARNED``
+    and return the tinted fallback fill rather than raising into the caller.
     """
+    global _BG_WARNED
     base: Optional[Image.Image] = None
-    if os.path.isfile(path):
-        try:
-            raw = Image.open(path).convert("RGB")
-            base = raw.resize((w, h), Image.LANCZOS)
-            base = base.filter(ImageFilter.GaussianBlur(radius=18))
-            base = ImageEnhance.Brightness(base).enhance(0.35)
-        except (OSError, IOError, ValueError) as exc:
-            log.warning("assets/bg.jpg load failed (%s); using fallback fill", exc)
-            base = None
-    else:
-        log.warning("assets/bg.jpg missing at %s; using fallback fill", path)
+    # review finding 5: guard Image.open so a broken/missing bg.jpg degrades
+    # to the fallback fill without propagating a Pillow exception to pnl.py
+    # callers; log once per process via _BG_WARNED.
+    try:
+        raw = Image.open(path).convert("RGB")
+        base = raw.resize((w, h), Image.LANCZOS)
+        base = base.filter(ImageFilter.GaussianBlur(radius=18))
+        base = ImageEnhance.Brightness(base).enhance(0.35)
+    except Exception as exc:  # noqa: BLE001 — any failure degrades to fallback fill
+        if not _BG_WARNED:
+            log.warning("assets/bg.jpg unavailable (%s); using fallback fill", exc)
+            _BG_WARNED = True
+        base = None
 
     if base is None:
         base = Image.new("RGB", (w, h), _FALLBACK_BG)

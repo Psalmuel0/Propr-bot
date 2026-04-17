@@ -61,9 +61,22 @@ def normalize_asset(asset: str) -> str:
     return upper
 
 
+def asset_ticker(asset: str) -> str:
+    """Strip any exchange prefix like ``xyz:`` and upper-case.
+
+    Used for comparing user-facing tickers against position rows where the
+    API echoes back the normalised ``xyz:CL`` form (review finding 4).
+    """
+    # review finding 4: single source of truth for ticker comparisons so
+    # OIL→CL aliasing doesn't silently break downstream lookups.
+    if not asset:
+        return ""
+    return asset.split(":")[-1].upper()
+
+
 def max_leverage_for(asset: str) -> int:
     """Return the enforced maximum leverage for *asset*."""
-    base = asset.split(":")[-1].upper()
+    base = asset_ticker(asset)
     if base in ("BTC", "ETH"):
         return MAX_LEVERAGE_BTC_ETH
     return MAX_LEVERAGE_OTHER
@@ -331,24 +344,21 @@ class ProprClient:
     async def cancel_order(self, account_id: str, order_id: str) -> Dict[str, Any]:
         """Cancel a single order.
 
-        A ``400`` response is treated as "already filled/cancelled": returned
-        as a soft-success ``{"status": "already_done", ...}`` dict instead of
-        raising. All other non-2xx statuses raise :class:`ProprAPIError`.
-
-        Note (PR #1 review finding #13): ``allow_status=(400,)`` means the
-        request helper returns the 400 body instead of raising, so the
-        detection has to inspect the response dict here. The outer
-        ``except ProprAPIError`` is kept as belt-and-braces for the rare
-        edge case where the body isn't JSON and we fall through to raising.
+        A ``400`` response is treated as "already filled/cancelled" ONLY when
+        :func:`_looks_like_already_done` confirms the body carries a terminal
+        sentinel (``code 13053`` or ``status/state ∈ {cancelled, filled,
+        expired}``). Anything else — including plain ``message: "bad_request"``
+        — re-raises as :class:`ProprAPIError` so callers see the real error.
         """
+        # review finding 1: don't blanket-swallow 400s; only soft-succeed on
+        # confirmed terminal-state sentinels so genuine client errors surface.
         try:
             result = await self._request(
                 "POST",
                 f"/accounts/{account_id}/orders/{order_id}/cancel",
-                allow_status=(400,),
             )
         except ProprAPIError as exc:
-            if exc.status == 400:
+            if exc.status == 400 and _looks_like_already_done(exc.body):
                 log.info("cancel_order %s returned 400 (already done): %s", order_id, exc.body)
                 return {"status": "already_done", "orderId": order_id}
             raise
@@ -548,19 +558,24 @@ class ProprClient:
 def _looks_like_already_done(body: Any) -> bool:
     """Detect "order already filled/cancelled" 400 sentinels in a body dict.
 
-    Propr surfaces these under a handful of shapes
-    (``message: "BAD_REQUEST"``, ``code: 13053``, ``status: 400``); rather
-    than string-match the text, check each known shape. Called from
-    :meth:`ProprClient.cancel_order` — see PR #1 review finding #13.
+    Tightened per review finding 1: the old ``message == "bad_request"``
+    catch-all matched any generic 400. We now require one of:
+      * ``code == 13053`` (documented Propr "order not active" code), OR
+      * ``status`` / ``state`` equal to ``cancelled``, ``filled``, or
+        ``expired`` (terminal order states).
+    Anything else bubbles up as a real :class:`ProprAPIError`.
     """
+    # review finding 1: narrow the already-done sentinel so genuine 400s
+    # (e.g. bad payloads) aren't silently swallowed as soft-success.
     if not isinstance(body, dict):
         return False
-    if str(body.get("message", "")).lower() == "bad_request":
-        return True
     if body.get("code") == 13053:
         return True
-    if body.get("status") == 400:
-        return True
+    terminal = {"cancelled", "filled", "expired"}
+    for key in ("status", "state"):
+        val = body.get(key)
+        if isinstance(val, str) and val.lower() in terminal:
+            return True
     return False
 
 
