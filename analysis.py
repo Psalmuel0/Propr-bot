@@ -25,7 +25,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 from groq import Groq
 
-from propr import ProprAPIError, ProprClient, max_leverage_for, normalize_asset
+from propr import (
+    HIP3_ASSETS,
+    ProprAPIError,
+    ProprClient,
+    asset_ticker,
+    max_leverage_for,
+    normalize_asset,
+)
 
 log = logging.getLogger(__name__)
 
@@ -277,8 +284,18 @@ async def fetch_spot_price(asset: str) -> Optional[Decimal]:
 
     Returns ``None`` on any network/parse failure so the caller can degrade
     gracefully. Never raises.
+
+    HIP-3 assets (equities/commodities like AAPL, GOLD, xyz:CL) don't trade
+    on Binance under a ``{TICKER}USDT`` pair, so we short-circuit with a
+    single info log instead of hammering the Binance endpoint with
+    guaranteed-404 requests (review finding 8).
     """
     if not asset:
+        return None
+    # review finding 8: skip Binance for HIP-3 tickers — no USDT pair exists.
+    ticker = asset_ticker(asset)
+    if asset.startswith("xyz:") or ticker in HIP3_ASSETS:
+        log.info("fetch_spot_price skipped for HIP-3 asset %s", asset)
         return None
     symbol = binance_symbol(asset)
     try:
@@ -337,6 +354,9 @@ class PendingIntent:
     created_at: datetime                # UTC
     message_id: Optional[int] = None
     notes: List[str] = field(default_factory=list)  # user-visible quirks (clamps, defaults)
+    # review finding 14: keep the original MarkdownV2 card body so the
+    # sweeper can append ``⏰ Confirmation expired`` to it on TTL.
+    message_text: Optional[str] = None
 
 
 PENDING_INTENTS: Dict[str, PendingIntent] = {}
@@ -785,24 +805,29 @@ def _parse_direction(text: str) -> str:
 _MARKET_ENTRY_TOKENS = frozenset({"market", "market order", "at market"})
 
 
-def _parse_entry(text: str) -> tuple[str, Optional[Decimal]]:
+def _parse_entry(text: str) -> tuple[Optional[str], Optional[Decimal]]:
     """Return ``(order_type, entry_price)`` parsed from ``Entry zone:``.
 
     - Exact ``market`` / ``market order`` / ``at market`` (with no digits on
       the line) → ``("market", None)``.
     - Single number → ``("limit", Decimal)``.
     - Range of two numbers → ``("limit", midpoint)``.
+    - No digits and not an exact market token (e.g. ``"wait for retest"``)
+      → ``(None, None)`` so the caller marks the trade non-executable
+      (review finding 6).
 
-    Prior behavior treated any substring "market" as market (finding #4) —
-    so ``"sweep the market at 94500"`` turned into a market order. Now we
-    require an exact token match and zero digits on the line before
-    returning market.
+    Prior behavior treated any substring "market" as market (PR #1 finding
+    #4) — so ``"sweep the market at 94500"`` turned into a market order.
+    Further tightened by review finding 6: free-form waiting text no
+    longer silently maps to a market order.
     """
+    # review finding 6: require an exact market token; otherwise demand
+    # a digit on the line or return (None, None) as non-executable.
     line = _line_after(text, "Entry zone")
     if not line:
         line = _line_after(text, "Entry")
     if not line:
-        return "market", None
+        return None, None
 
     stripped = line.strip().lower()
     if stripped in _MARKET_ENTRY_TOKENS and not any(c.isdigit() for c in line):
@@ -810,7 +835,7 @@ def _parse_entry(text: str) -> tuple[str, Optional[Decimal]]:
 
     nums = _all_decimals(line)
     if not nums:
-        return "market", None
+        return None, None
     low = stripped
     if len(nums) >= 2 and ("-" in line or "–" in line or "—" in line or "to" in low):
         mid = (nums[0] + nums[1]) / Decimal(2)
@@ -820,12 +845,19 @@ def _parse_entry(text: str) -> tuple[str, Optional[Decimal]]:
 
 # Tokens that signal the suggested size is a percentage / notional and NOT a
 # raw quantity we can pass to the exchange; reject these to avoid placing
-# massively wrong orders. See PR #1 review finding #5.
+# massively wrong orders. See PR #1 review finding #5, plus review
+# finding 11 which added plain-English magnitude words.
 _SIZE_NON_QUANTITY_TOKENS = (
     "%", "percent", "$", "usd", "usdc", "notional",
     "of account", "of balance",
+    # review finding 11: reject English-word notionals/magnitudes.
+    "worth", "equivalent", "hundred", "thousand", "million",
 )
-_SIZE_QUANTITY_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]{2,10})?\s*$")
+# review finding 7: accept thousands-separated integer parts
+# (``"1,000 DOGE"``) by allowing ``1-3 digits`` + ``,{3 digits}``.
+_SIZE_QUANTITY_RE = re.compile(
+    r"^\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*([A-Z]{2,10})?\s*$"
+)
 
 
 def _parse_size(text: str) -> Optional[Decimal]:
@@ -844,7 +876,9 @@ def _parse_size(text: str) -> Optional[Decimal]:
         return None
     if not _SIZE_QUANTITY_RE.match(line):
         return None
-    return _first_decimal(line)
+    # review finding 7: strip thousands commas before Decimal coercion.
+    cleaned = line.replace(",", "")
+    return _first_decimal(cleaned)
 
 
 def _parse_leverage(text: str) -> Optional[int]:
@@ -926,8 +960,11 @@ def parse_groq_recommendation(text: str) -> Dict[str, Any]:
     confidence = _parse_confidence(text)
     recommendation_label = _parse_recommendation_label(text)
 
+    # review finding 6: treat a non-parseable entry (order_type is None) as
+    # non-executable so free-form "wait for retest" entries can't auto-fire.
     executable = (
         direction in ("long", "short")
+        and order_type is not None
         and quantity is not None
         and stop_loss is not None
         and take_profit_1 is not None
@@ -998,15 +1035,29 @@ async def sweep_pending_trades(bot: Any) -> None:
                 pi = PENDING_INTENTS.pop(pid, None)
                 if pi is None:
                     continue
+                # review finding 14: edit the confirmation card itself so the
+                # expired state is visible inline, not just as a follow-up.
                 if pi.message_id is not None:
-                    try:
-                        await bot.edit_message_reply_markup(
-                            chat_id=pi.chat_id,
-                            message_id=pi.message_id,
-                            reply_markup=None,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log.debug("edit_message_reply_markup failed: %s", exc)
+                    if pi.message_text:
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=pi.chat_id,
+                                message_id=pi.message_id,
+                                text=pi.message_text + "\n\n⏰ Confirmation expired",
+                                parse_mode="MarkdownV2",
+                                reply_markup=None,
+                            )
+                        except Exception as exc:  # noqa: BLE001 — failed edit must not abort sweep
+                            log.debug("edit expired intent card failed: %s", exc)
+                    else:
+                        try:
+                            await bot.edit_message_reply_markup(
+                                chat_id=pi.chat_id,
+                                message_id=pi.message_id,
+                                reply_markup=None,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("edit_message_reply_markup failed: %s", exc)
                 try:
                     await bot.send_message(
                         chat_id=pi.chat_id,

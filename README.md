@@ -102,6 +102,8 @@ Examples:
 Same prompts work with `/trade` prefixed (useful when the first word would
 collide with a reserved command name, e.g. `/trade close all btc`).
 
+Confirmations expire after 5 minutes — send the message again to get a fresh card.
+
 ## File structure
 
 - `bot.py` — entry point, wires the Telegram `Application` and background tasks

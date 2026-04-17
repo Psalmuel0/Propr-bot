@@ -40,7 +40,13 @@ from analysis import (
     run_analysis,
 )
 from pnl import build_snapshot, format_snapshot_markdown, render_snapshot_image
-from propr import ProprAPIError, ProprClient, max_leverage_for, normalize_asset
+from propr import (
+    ProprAPIError,
+    ProprClient,
+    asset_ticker,
+    max_leverage_for,
+    normalize_asset,
+)
 from utils import escape_md, fmt_num
 
 log = logging.getLogger(__name__)
@@ -204,11 +210,41 @@ def _parse_price(raw: str) -> Decimal:
 
 
 def _pos_asset_upper(p: dict) -> str:
-    return str(p.get("asset", "")).split(":")[-1].upper()
+    # review finding 4: delegate to the canonical asset_ticker helper so
+    # OIL→CL (and any other xyz: alias) compares the same way downstream.
+    return asset_ticker(p.get("asset", ""))
 
 
 def _pos_side(p: dict) -> str:
     return str(p.get("positionSide") or p.get("side") or "").lower()
+
+
+def _extract_order_id(response: Any) -> Optional[str]:
+    """Pull the server-assigned ``orderId`` out of a ``place_order`` response.
+
+    Propr returns orders in one of two envelopes — either ``data[0]`` when
+    the caller submitted an ``orders`` array, or a flat object with
+    ``orderId``. Review finding 2 needs this id to roll back a naked entry
+    after an SL failure by cancelling the entry before closing the fill.
+    """
+    # review finding 2: normalise both response shapes into a single id.
+    if not isinstance(response, dict):
+        return None
+    direct = response.get("orderId") or response.get("id")
+    if direct:
+        return str(direct)
+    data = response.get("data")
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            candidate = first.get("orderId") or first.get("id")
+            if candidate:
+                return str(candidate)
+    if isinstance(data, dict):
+        candidate = data.get("orderId") or data.get("id")
+        if candidate:
+            return str(candidate)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -487,11 +523,16 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply(update, "Usage: `/close <asset>`")
             return
         asset = args[0].upper()
+        # review finding 4: compare positions via the venue ticker so aliases
+        # like OIL→CL route through cleanly; keep ``asset`` for user replies.
+        asset_norm_ticker = asset_ticker(normalize_asset(asset))
 
         client = _get_client(context)
         account_id = await _ensure_account_id(context)
         positions = await client.get_positions(account_id)
-        target = next((p for p in positions if _pos_asset_upper(p) == asset), None)
+        target = next(
+            (p for p in positions if _pos_asset_upper(p) == asset_norm_ticker), None
+        )
         if target is None:
             await _reply(update, f"⚠️ No open position on `{escape_md(asset)}`")
             return
@@ -577,13 +618,16 @@ async def sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply(update, "Usage: `/sl <asset> <triggerPrice>`")
             return
         asset = args[0].upper()
+        # review finding 4: resolve through normalize→asset_ticker so alias
+        # tokens (e.g. OIL→CL) match the position asset row reliably.
+        asset_norm_ticker = asset_ticker(normalize_asset(asset))
         trigger = _parse_price(args[1])
 
         client = _get_client(context)
         account_id = await _ensure_account_id(context)
         positions = await client.get_positions(account_id)
         target = next(
-            (p for p in positions if _pos_asset_upper(p) == asset),
+            (p for p in positions if _pos_asset_upper(p) == asset_norm_ticker),
             None,
         )
         if target is None:
@@ -619,13 +663,15 @@ async def tp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply(update, "Usage: `/tp <asset> <triggerPrice>`")
             return
         asset = args[0].upper()
+        # review finding 4: same alias-safe comparison as /sl.
+        asset_norm_ticker = asset_ticker(normalize_asset(asset))
         trigger = _parse_price(args[1])
 
         client = _get_client(context)
         account_id = await _ensure_account_id(context)
         positions = await client.get_positions(account_id)
         target = next(
-            (p for p in positions if _pos_asset_upper(p) == asset),
+            (p for p in positions if _pos_asset_upper(p) == asset_norm_ticker),
             None,
         )
         if target is None:
@@ -977,9 +1023,13 @@ async def _execute_parsed_trade(
             return
 
     # Step 2: entry
+    # review finding 2: capture the entry orderId from the place_order envelope
+    # so that on SL failure we can cancel the unfilled limit before closing any
+    # partial fill (close_position is a no-op against a still-open limit).
+    entry_order_id: Optional[str] = None
     try:
         if order_type == "limit" and entry_price is not None:
-            await client.place_order(
+            entry_resp = await client.place_order(
                 account_id=account_id,
                 asset=asset,
                 type="limit",
@@ -992,7 +1042,7 @@ async def _execute_parsed_trade(
             )
             entry_desc = f"limit @ {fmt_num(entry_price)}"
         else:
-            await client.place_order(
+            entry_resp = await client.place_order(
                 account_id=account_id,
                 asset=asset,
                 type="market",
@@ -1003,6 +1053,7 @@ async def _execute_parsed_trade(
                 reduceOnly=False,
             )
             entry_desc = "market"
+        entry_order_id = _extract_order_id(entry_resp)
     except Exception as exc:  # noqa: BLE001
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1027,21 +1078,34 @@ async def _execute_parsed_trade(
             reduceOnly=True,
         )
     except Exception as sl_exc:  # noqa: BLE001
+        # review finding 2: for limit entries the order may still be open /
+        # only partially filled. Cancel the entry first so the naked limit
+        # doesn't keep living; then close any realised fill.
+        cancel_err: Optional[Exception] = None
+        if order_type == "limit" and entry_order_id:
+            try:
+                await client.cancel_order(account_id, entry_order_id)
+            except Exception as c_exc:  # noqa: BLE001
+                cancel_err = c_exc
         try:
             await client.close_position(account_id, asset, position_side)
         except Exception as close_exc:  # noqa: BLE001
+            cancel_reason = (
+                f" | cancel={cancel_err}" if cancel_err else ""
+            )
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"🚨 SL placement failed AND close failed. "
                     f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
-                    f"Reasons: SL={sl_exc} | close={close_exc}"
+                    f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
                 ),
             )
             return
+        rollback_msg = "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ SL placement failed; position closed. Reason: {sl_exc}",
+            text=f"❌ SL placement failed; position {rollback_msg}. Reason: {sl_exc}",
         )
         return
 
@@ -1200,9 +1264,14 @@ def _render_intent_card(
         usd_amount = _intent_decimal(intent.get("usd_amount"))
         lev_label = f"{leverage}x" if leverage else "1x"
         if usd_amount is not None and resolved_qty is not None:
+            # review finding 3: disambiguate USD-sized opens so users see
+            # margin vs notional and the leverage multiplier explicitly.
+            lev_mul = Decimal(leverage) if leverage else Decimal(1)
+            notional = usd_amount * lev_mul
             lines.append(
                 f"Size: {escape_md(qty_str)} {escape_md(asset)} "
-                f"\\(≈ ${escape_md(fmt_num(usd_amount))} @ {escape_md(lev_label)}\\)"
+                f"\\(~${escape_md(fmt_num(notional))} notional, "
+                f"${escape_md(fmt_num(usd_amount))} margin @ {escape_md(lev_label)}\\)"
             )
         else:
             lines.append(f"Size: {escape_md(qty_str)} {escape_md(asset)}")
@@ -1349,7 +1418,10 @@ async def _process_prompt(
     notes_text = str(intent.get("notes") or "").strip()
 
     if kind == "unknown" or kind == "":
-        reason = notes_text or "Intent not recognised"
+        # review finding 15: always surface the parser's notes; if empty fall
+        # back to a generic human-readable reason so the reply never reads
+        # like an unexplained rejection.
+        reason = notes_text or "The request didn't map to a supported action."
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❓ Sorry, I couldn't parse that\\. {escape_md(reason)}",
@@ -1411,6 +1483,11 @@ async def _process_prompt(
                 return
             lev_mul = Decimal(leverage) if leverage else Decimal(1)
             try:
+                # review finding 3: ``qty = (usd × leverage) / price`` is
+                # intentional — the usd_amount is the MARGIN the user wants
+                # to deploy, so the resulting notional is ``usd × leverage``
+                # (e.g. $4000 margin at 5x → $20,000 notional → 0.267 BTC
+                # @ $75k). Card text below spells this out unambiguously.
                 raw_qty = (usd_raw * lev_mul) / price
             except (InvalidOperation, ZeroDivisionError) as exc:
                 log.warning("qty compute failed: %s", exc)
@@ -1496,6 +1573,9 @@ async def _process_prompt(
         created_at=datetime.now(timezone.utc),
         message_id=sent.message_id,
         notes=list(extra_notes),
+        # review finding 14: persist the original card markdown so the
+        # sweeper can edit it with "⏰ Confirmation expired" on TTL.
+        message_text=card,
     )
 
 
@@ -1537,6 +1617,35 @@ async def _handle_intent_callback(
     await query.answer("Executing…")
 
     PENDING_INTENTS.pop(pending_id, None)
+
+    # review finding 10: analysis intents previously reported "✅ Executed"
+    # immediately after queueing the nested /analysis flow — the flow was
+    # fire-and-forget. Now we update the card to "Running analysis…" first,
+    # await the real pipeline, and only then report success / failure.
+    kind = str(pending.intent.get("intent", "")).lower()
+    if kind == "analysis":
+        asset = str(pending.intent.get("asset") or "").upper()
+        timeframe = str(pending.intent.get("timeframe") or "1h")
+        await _append_status_to_intent_message(
+            query, f"✍️ Running analysis on {asset}…"
+        )
+        try:
+            await _run_analysis_flow(
+                context,
+                chat_id=chat_id,
+                asset=asset,
+                timeframe=timeframe,
+                direction=pending.intent.get("side"),
+                intro_reply=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("analysis intent failed: %s", exc)
+            await _append_status_to_intent_message(
+                query, f"❌ Failed: {exc}"
+            )
+            return
+        await _append_status_to_intent_message(query, "✅ Done")
+        return
 
     try:
         summary = await _execute_intent(context, chat_id, pending)
@@ -1601,19 +1710,9 @@ async def _execute_intent(
         return await _execute_intent_tp(client, account_id, intent)
     if kind == "setleverage":
         return await _execute_intent_set_leverage(client, account_id, intent)
-    if kind == "analysis":
-        timeframe = str(intent.get("timeframe") or "1h")
-        asyncio.create_task(
-            _run_analysis_flow(
-                context,
-                chat_id=chat_id,
-                asset=asset,
-                timeframe=timeframe,
-                direction=intent.get("side"),
-                intro_reply=None,
-            )
-        )
-        return f"Queued analysis for {asset} ({timeframe})"
+    # review finding 10: the analysis branch is handled directly in
+    # _handle_intent_callback so the card can reflect in-progress / done
+    # state against the real flow rather than declaring success on queue.
     raise ProprAPIError(400, f"Unsupported intent: {kind}")
 
 
@@ -1674,8 +1773,11 @@ async def _execute_intent_open(
             raise ProprAPIError(0, f"leverage step failed: {exc}") from exc
 
     # Entry step.
+    # review finding 2: record the entry orderId so a later SL failure can
+    # cancel an unfilled limit before attempting close_position.
+    entry_order_id: Optional[str] = None
     if order_type == "limit" and limit_price is not None and limit_price > 0:
-        await client.place_order(
+        entry_resp = await client.place_order(
             account_id=account_id,
             asset=asset,
             type="limit",
@@ -1688,7 +1790,7 @@ async def _execute_intent_open(
         )
         entry_desc = f"limit @ {fmt_num(limit_price)}"
     else:
-        await client.place_order(
+        entry_resp = await client.place_order(
             account_id=account_id,
             asset=asset,
             type="market",
@@ -1699,31 +1801,48 @@ async def _execute_intent_open(
             reduceOnly=False,
         )
         entry_desc = "market"
+    entry_order_id = _extract_order_id(entry_resp)
 
     # Optional SL — rollback pattern: if placement fails after a live entry,
-    # attempt an immediate close (analysis-execute pattern, commit f81820f0).
+    # cancel any unfilled limit entry then attempt an immediate close on the
+    # filled portion (review finding 2 hardens the previous close-only path,
+    # which left unfilled limit entries live on the book).
     extras: List[str] = []
     if stop_loss is not None and stop_loss > 0:
         try:
             await client.stop_loss(account_id, asset, quantity, stop_loss, side)
             extras.append(f"SL: {fmt_num(stop_loss)}")
         except Exception as sl_exc:  # noqa: BLE001
+            # review finding 2: same rollback sequence as the analysis flow —
+            # cancel unfilled limit entry first, then close any fill.
+            cancel_err: Optional[Exception] = None
+            if order_type == "limit" and entry_order_id:
+                try:
+                    await client.cancel_order(account_id, entry_order_id)
+                except Exception as c_exc:  # noqa: BLE001
+                    cancel_err = c_exc
             try:
                 await client.close_position(account_id, asset, side)
             except Exception as close_exc:  # noqa: BLE001
+                cancel_reason = (
+                    f" | cancel={cancel_err}" if cancel_err else ""
+                )
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"🚨 SL placement failed AND close failed. "
                         f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
-                        f"Reasons: SL={sl_exc} | close={close_exc}"
+                        f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
                     ),
                 )
                 raise ProprAPIError(
                     0, f"SL failed then close failed — MANUAL INTERVENTION NEEDED ({sl_exc})"
                 ) from sl_exc
+            rollback_msg = (
+                "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
+            )
             raise ProprAPIError(
-                0, f"SL placement failed; position closed ({sl_exc})"
+                0, f"SL placement failed; position {rollback_msg} ({sl_exc})"
             ) from sl_exc
 
     # Optional TP — non-fatal; user keeps SL protection.
@@ -1750,12 +1869,15 @@ async def _execute_intent_close(
 ) -> str:
     """Execute a ``close`` intent: optional side, auto-detect if missing."""
     asset = str(intent.get("asset") or "")
+    # review finding 4: compare via venue ticker so alias asset (OIL) matches
+    # the xyz:CL position row that the API returns.
+    asset_norm_ticker = asset_ticker(normalize_asset(asset))
     side = str(intent.get("side") or "").lower()
 
     if side not in ("long", "short"):
         positions = await client.get_positions(account_id)
         target = next(
-            (p for p in positions if _pos_asset_upper(p) == asset),
+            (p for p in positions if _pos_asset_upper(p) == asset_norm_ticker),
             None,
         )
         if target is None:
@@ -1775,13 +1897,15 @@ async def _execute_intent_sl(
 ) -> str:
     """Execute an ``sl`` intent: attach stop-loss to the current position."""
     asset = str(intent.get("asset") or "")
+    # review finding 4: same venue-ticker lookup as _execute_intent_close.
+    asset_norm_ticker = asset_ticker(normalize_asset(asset))
     trigger = _intent_decimal(intent.get("stop_loss"))
     if trigger is None or trigger <= 0:
         raise ProprAPIError(400, "sl intent requires a positive stop_loss")
     side_hint = str(intent.get("side") or "").lower()
 
     positions = await client.get_positions(account_id)
-    candidates = [p for p in positions if _pos_asset_upper(p) == asset]
+    candidates = [p for p in positions if _pos_asset_upper(p) == asset_norm_ticker]
     if side_hint in ("long", "short"):
         candidates = [p for p in candidates if _pos_side(p) == side_hint]
     target = candidates[0] if candidates else None
@@ -1803,13 +1927,15 @@ async def _execute_intent_tp(
 ) -> str:
     """Execute a ``tp`` intent: attach take-profit to the current position."""
     asset = str(intent.get("asset") or "")
+    # review finding 4: resolve alias to venue ticker for position compare.
+    asset_norm_ticker = asset_ticker(normalize_asset(asset))
     trigger = _intent_decimal(intent.get("take_profit"))
     if trigger is None or trigger <= 0:
         raise ProprAPIError(400, "tp intent requires a positive take_profit")
     side_hint = str(intent.get("side") or "").lower()
 
     positions = await client.get_positions(account_id)
-    candidates = [p for p in positions if _pos_asset_upper(p) == asset]
+    candidates = [p for p in positions if _pos_asset_upper(p) == asset_norm_ticker]
     if side_hint in ("long", "short"):
         candidates = [p for p in candidates if _pos_side(p) == side_hint]
     target = candidates[0] if candidates else None
