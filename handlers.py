@@ -1082,17 +1082,34 @@ async def _execute_parsed_trade(
         # only partially filled. Cancel the entry first so the naked limit
         # doesn't keep living; then close any realised fill.
         cancel_err: Optional[Exception] = None
+        cancelled = False
         if order_type == "limit" and entry_order_id:
             try:
                 await client.cancel_order(account_id, entry_order_id)
+                cancelled = True
             except Exception as c_exc:  # noqa: BLE001
                 cancel_err = c_exc
         try:
             await client.close_position(account_id, asset, position_side)
+            closed = True
+        except ProprAPIError as close_exc:
+            # 404 here means "no fill ever occurred" — if we also cancelled
+            # the entry, the rollback is actually clean.
+            if close_exc.status == 404 and (cancelled or order_type == "market"):
+                closed = False  # nothing to close; not an error
+            else:
+                cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🚨 SL placement failed AND close failed. "
+                        f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                        f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
+                    ),
+                )
+                return
         except Exception as close_exc:  # noqa: BLE001
-            cancel_reason = (
-                f" | cancel={cancel_err}" if cancel_err else ""
-            )
+            cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -1102,10 +1119,17 @@ async def _execute_parsed_trade(
                 ),
             )
             return
-        rollback_msg = "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
+        if cancelled and not closed:
+            rollback_msg = "entry cancelled (nothing filled)"
+        elif cancelled and closed:
+            rollback_msg = "cancelled + partial fill closed"
+        elif closed:
+            rollback_msg = "closed"
+        else:
+            rollback_msg = "no position open"
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ SL placement failed; position {rollback_msg}. Reason: {sl_exc}",
+            text=f"❌ SL placement failed; {rollback_msg}. Reason: {sl_exc}",
         )
         return
 
@@ -1816,17 +1840,36 @@ async def _execute_intent_open(
             # review finding 2: same rollback sequence as the analysis flow —
             # cancel unfilled limit entry first, then close any fill.
             cancel_err: Optional[Exception] = None
+            cancelled = False
             if order_type == "limit" and entry_order_id:
                 try:
                     await client.cancel_order(account_id, entry_order_id)
+                    cancelled = True
                 except Exception as c_exc:  # noqa: BLE001
                     cancel_err = c_exc
+            closed = False
             try:
                 await client.close_position(account_id, asset, side)
+                closed = True
+            except ProprAPIError as close_exc:
+                if close_exc.status == 404 and (cancelled or order_type == "market"):
+                    # Nothing to close — entry never filled. Clean rollback.
+                    pass
+                else:
+                    cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🚨 SL placement failed AND close failed. "
+                            f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                            f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
+                        ),
+                    )
+                    raise ProprAPIError(
+                        0, f"SL failed then close failed — MANUAL INTERVENTION NEEDED ({sl_exc})"
+                    ) from sl_exc
             except Exception as close_exc:  # noqa: BLE001
-                cancel_reason = (
-                    f" | cancel={cancel_err}" if cancel_err else ""
-                )
+                cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -1838,11 +1881,16 @@ async def _execute_intent_open(
                 raise ProprAPIError(
                     0, f"SL failed then close failed — MANUAL INTERVENTION NEEDED ({sl_exc})"
                 ) from sl_exc
-            rollback_msg = (
-                "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
-            )
+            if cancelled and not closed:
+                rollback_msg = "entry cancelled (nothing filled)"
+            elif cancelled and closed:
+                rollback_msg = "cancelled + partial fill closed"
+            elif closed:
+                rollback_msg = "closed"
+            else:
+                rollback_msg = "no position open"
             raise ProprAPIError(
-                0, f"SL placement failed; position {rollback_msg} ({sl_exc})"
+                0, f"SL placement failed; {rollback_msg} ({sl_exc})"
             ) from sl_exc
 
     # Optional TP — non-fatal; user keeps SL protection.
