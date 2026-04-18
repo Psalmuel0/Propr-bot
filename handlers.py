@@ -1270,7 +1270,7 @@ def _render_intent_card(
             notional = usd_amount * lev_mul
             lines.append(
                 f"Size: {escape_md(qty_str)} {escape_md(asset)} "
-                f"\\(~${escape_md(fmt_num(notional))} notional, "
+                f"\\(\\~${escape_md(fmt_num(notional))} notional, "
                 f"${escape_md(fmt_num(usd_amount))} margin @ {escape_md(lev_label)}\\)"
             )
         else:
